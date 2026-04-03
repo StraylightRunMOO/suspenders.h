@@ -1,0 +1,169 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+Build/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+
+# Compiled binaries
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.so.*
+*.dylib
+*.lib
+*.a
+*.o
+*.obj
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# IDE - CLion/JetBrains
+.idea/
+*.iml
+*.iws
+
+# IDE - VS Code
+.vscode/
+*.code-workspace
+
+# IDE - Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+ipch/
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# IDE - Xcode
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# IDE - Eclipse
+.project
+.cproject
+.settings/
+
+# OS specific files
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.nfs*
+
+# Backup files
+*.bak
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.#*
+
+# Tags
+TAGS
+tags
+cscope.*
+ncscope.*
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+coverage/
+*.lcov
+htmlcov/
+
+# Profiling
+gmon.out
+*.prof
+*.profdata
+
+# Package managers
+conan.lock
+conanbuildinfo.*
+conaninfo.txt
+graph_info.json
+vcpkg_installed/
+
+# Documentation generated
+docs/_build/
+doxygen/
+
+# Core dumps
+core
+core.*
+vcore.*
+*.core
