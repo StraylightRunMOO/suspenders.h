@@ -83,7 +83,7 @@ done:
 void server_listener(void *arg) {
     (void)arg;
     hose_t listener;
-    hose_init(&listener, suspenders_ring(), NULL);
+    hose_init(&listener, NULL);
     
     if (!hose_listen(&listener, "tcp://0.0.0.0:12345")) return;
 
@@ -112,7 +112,7 @@ void client_worker(void *arg) {
     char recv_buf[256];
     int pongs_received = 0;
 
-    hose_init(&conn, suspenders_ring(), &b);
+    hose_init(&conn, &b);
     
     /* Connect to server */
     char uri[64];
@@ -158,12 +158,7 @@ void client_worker(void *arg) {
     if (__atomic_add_fetch(&clients_done, 1, __ATOMIC_RELAXED) == NUM_CLIENTS) {
         running = 0;
         /* Cancel the server's pending accept operation */
-        struct io_uring_sqe *sqe = io_uring_get_sqe(suspenders_ring());
-        if (sqe) {
-            io_uring_prep_cancel(sqe, server_cr, 0);
-            io_uring_sqe_set_data(sqe, NULL);
-            io_uring_submit(suspenders_ring());
-        }
+        suspenders_cancel(server_cr);
     }
 }
 
@@ -175,7 +170,7 @@ int main(void) {
     printf("Starting %d clients, each sending %d PINGs...\n\n", NUM_CLIENTS, NUM_PINGS);
     
     /* Initialize Suspenders */
-    suspenders_init(4, 256);  /* 4 workers, 256 io_uring entries */
+    suspenders_init(4, 256);  /* 4 workers, 256 backend queue hint */
     
     /* Start server listener */
     server_cr = suspenders_spawn(server_listener, NULL, SUSPENDERS_QOS_HIGH);

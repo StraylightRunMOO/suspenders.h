@@ -4,7 +4,7 @@
  * suspenders.hpp - Modern C++17 wrapper for Suspenders
  * 
  * Features:
- *   - RAII runtime context, pipes, and buffers
+ *   - RAII runtime context, hoses, and buffers
  *   - Type-safe Channel<T> with zero-copy semantics (T must be trivially copyable)
  *   - Lambda/functor coroutine spawning (no manual void* casting)
  *   - std::string_view integration for URIs and buffers
@@ -69,8 +69,8 @@ enum class State {
 
 class Context {
 public:
-    explicit Context(unsigned num_workers = 0, unsigned io_uring_entries = 256) {
-        suspenders_init(num_workers, io_uring_entries);
+    explicit Context(unsigned num_workers = 0, unsigned queue_hint = 256) {
+        suspenders_init(num_workers, queue_hint);
     }
     
     ~Context() {
@@ -85,10 +85,6 @@ public:
     
     void run() {
         suspenders_run();
-    }
-    
-    [[nodiscard]] static struct io_uring* ring() {
-        return suspenders_ring();
     }
 };
 
@@ -109,6 +105,10 @@ public:
     
     void boost(QoS new_qos) {
         if (cr_) suspenders_boost(cr_, static_cast<suspenders_qos_t>(new_qos));
+    }
+    
+    void cancel() {
+        if (cr_) suspenders_cancel(cr_);
     }
     
     [[nodiscard]] State state() const {
@@ -144,7 +144,6 @@ public:
     }
     
     ~Channel() {
-        // Note: C API lacks explicit destroy, so we manually free via memento
         if (ch_) {
             memento_thread_heap_free(memento_thread_heap_get(), ch_, sizeof(suspenders_chan_t));
         }
@@ -171,7 +170,6 @@ public:
     
     [[nodiscard]] bool send(const T& value) {
         if (!ch_) return false;
-        // C API does memcpy internally, so const_cast is safe here
         return suspenders_chan_send(ch_, const_cast<T*>(&value));
     }
     
@@ -192,7 +190,7 @@ public:
 };
 
 // ============================================================================
-// Async Hose (TCP/Unix domain socket abstraction)
+// Async Hose (transport-agnostic stream abstraction)
 // ============================================================================
 
 class Hose {
@@ -202,11 +200,11 @@ class Hose {
 public:
     Hose() {
         memset(&hose_, 0, sizeof(hose_));
-        hose_.fd = -1;
+        hose_.fd = SUSPENDERS_INVALID_SOCK;
     }
     
-    explicit Hose(struct io_uring* ring, struct buf* buffer = nullptr) : Hose() {
-        hose_init(&hose_, ring ? ring : suspenders_ring(), buffer);
+    explicit Hose(struct buf* buffer) : Hose() {
+        hose_init(&hose_, buffer);
         valid_ = true;
     }
     
@@ -224,7 +222,7 @@ public:
         : hose_(other.hose_), valid_(other.valid_) 
     {
         other.valid_ = false;
-        other.hose_.fd = -1;
+        other.hose_.fd = SUSPENDERS_INVALID_SOCK;
     }
     
     Hose& operator=(Hose&& other) noexcept {
@@ -233,7 +231,7 @@ public:
             hose_ = other.hose_;
             valid_ = other.valid_;
             other.valid_ = false;
-            other.hose_.fd = -1;
+            other.hose_.fd = SUSPENDERS_INVALID_SOCK;
         }
         return *this;
     }
@@ -253,7 +251,7 @@ public:
         if (!valid_) return false;
         hose_t client_hose;
         if (hose_accept(&hose_, &client_hose)) {
-            client = Hose();  // Reset client
+            client = Hose();
             client.hose_ = client_hose;
             client.valid_ = true;
             return true;
@@ -270,6 +268,16 @@ public:
     [[nodiscard]] ssize_t write(const void* src, size_t len) {
         if (!valid_) return -1;
         return hose_write(&hose_, src, len);
+    }
+    
+    [[nodiscard]] ssize_t recvfrom(void* dest, size_t len, struct sockaddr* addr, socklen_t* addrlen) {
+        if (!valid_) return -1;
+        return hose_recvfrom(&hose_, dest, len, addr, addrlen);
+    }
+    
+    [[nodiscard]] ssize_t sendto(const void* src, size_t len, const struct sockaddr* addr, socklen_t addrlen) {
+        if (!valid_) return -1;
+        return hose_sendto(&hose_, src, len, addr, addrlen);
     }
     
     template<typename T>
@@ -289,8 +297,8 @@ public:
         }
     }
     
-    [[nodiscard]] int fd() const { return hose_.fd; }
-    [[nodiscard]] bool valid() const { return valid_ && hose_.fd >= 0; }
+    [[nodiscard]] suspenders_sock_t fd() const { return hose_.fd; }
+    [[nodiscard]] bool valid() const { return valid_ && hose_.fd != SUSPENDERS_INVALID_SOCK; }
     [[nodiscard]] hose_t* native() { return &hose_; }
 };
 
@@ -356,7 +364,6 @@ public:
     
     template<typename Iter>
     [[nodiscard]] bool append(Iter first, Iter last) {
-        // Optimized for iterators
         if constexpr (std::is_same_v<typename std::iterator_traits<Iter>::value_type, char>) {
             std::string_view sv(&*first, std::distance(first, last));
             return append(sv);
@@ -374,7 +381,7 @@ public:
     }
     
     void shrink_to_fit() {
-        // Not supported by underlying buf, but we could realloc
+        // Not supported by underlying buf
     }
     
     // Accessors
@@ -414,7 +421,7 @@ template<typename F>
 void coroutine_trampoline(void* arg) {
     auto* func = static_cast<std::decay_t<F>*>(arg);
     (*func)();
-    delete func;  // Clean up the allocated lambda
+    delete func;
 }
 
 } // namespace detail
@@ -446,7 +453,6 @@ template<typename F>
 // ============================================================================
 
 [[nodiscard]] inline Task current_task() {
-    // suspenders_running is thread_local in C lib
     return Task(suspenders_running);
 }
 
@@ -459,7 +465,6 @@ inline void suspend() {
 }
 
 inline void sleep_ms(int ms) {
-    // Could implement via io_uring timeout, for now just yield
     (void)ms;
     yield();
 }
@@ -468,7 +473,7 @@ inline void sleep_ms(int ms) {
 // Async I/O Helpers
 // ============================================================================
 
-#if defined(__linux__)
+#if SUSPENDERS_BACKEND_IOURING
 inline void writev_async(int fd, struct iovec* iovs, int count) {
     suspenders_writev_async(fd, iovs, count);
 }

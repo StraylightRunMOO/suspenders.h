@@ -41,8 +41,8 @@ int main(void) {
     /* Initialize contexts with valid stack pointers */
     memset(&ctx_a, 0, sizeof(ctx_a));
     memset(&ctx_b, 0, sizeof(ctx_b));
-    ctx_a.sp = ((uintptr_t)stack_a + stack_size) & ~15UL;
-    ctx_b.sp = ((uintptr_t)stack_b + stack_size) & ~15UL;
+    ctx_a.sp = (void*)(((uintptr_t)stack_a + stack_size) & ~15UL);
+    ctx_b.sp = (void*)(((uintptr_t)stack_b + stack_size) & ~15UL);
     
     /* Note: For a pure raw switch benchmark, we use self-switching.
      * This measures only the register save/restore without the complexity
