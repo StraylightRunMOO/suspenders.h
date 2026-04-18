@@ -271,7 +271,6 @@ struct hose_s {
     hose_protocol_t  protocol;
     suspenders_sock_t fd;
     struct buf      *buffer;
-    suspenders_cr_t      *owner;
     const suspenders_transport_ops_t *transport;
 };
 
@@ -1351,7 +1350,6 @@ static bool tcp_accept(hose_t *listener, hose_t *client) {
             client->protocol = listener->protocol;
             client->transport = listener->transport;
             client->roles = HOSE_ROLE_READER | HOSE_ROLE_WRITER;
-            client->owner = NULL;  /* Handler coroutine will use suspenders_running */
             return true;
         }
         int err = suspenders_sock_errno();
@@ -1367,7 +1365,7 @@ static bool tcp_accept(hose_t *listener, hose_t *client) {
 static ssize_t tcp_read(hose_t *h, void *dest, size_t len) {
     if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
 
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_recv(h->fd, dest, len, 0);
         if (n >= 0) return n;
@@ -1384,7 +1382,7 @@ static ssize_t tcp_read(hose_t *h, void *dest, size_t len) {
 static ssize_t tcp_write(hose_t *h, const void *src, size_t len) {
     if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
 
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     size_t written = 0;
     while (written < len) {
         ssize_t n = suspenders_sock_send(h->fd, (const char*)src + written, len - written, 0);
@@ -1478,7 +1476,7 @@ static bool udp_listen(hose_t *h, const char *host, int port) {
 
 static ssize_t udp_read(hose_t *h, void *dest, size_t len) {
     if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_recv(h->fd, dest, len, 0);
         if (n >= 0) return n;
@@ -1493,7 +1491,7 @@ static ssize_t udp_read(hose_t *h, void *dest, size_t len) {
 
 static ssize_t udp_write(hose_t *h, const void *src, size_t len) {
     if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_send(h->fd, src, len, 0);
         if (n >= 0) return n;
@@ -1508,7 +1506,7 @@ static ssize_t udp_write(hose_t *h, const void *src, size_t len) {
 
 static ssize_t udp_recvfrom(hose_t *h, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen) {
     if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
         ssize_t n = recvfrom(h->fd, (char*)dest, (int)len, 0, addr, addrlen);
@@ -1527,7 +1525,7 @@ static ssize_t udp_recvfrom(hose_t *h, void *dest, size_t len, struct sockaddr *
 
 static ssize_t udp_sendto(hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen) {
     if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
         ssize_t n = sendto(h->fd, (const char*)src, (int)len, 0, addr, addrlen);
@@ -1657,7 +1655,6 @@ static bool unix_accept(hose_t *listener, hose_t *client) {
             client->protocol = listener->protocol;
             client->transport = listener->transport;
             client->roles = HOSE_ROLE_READER | HOSE_ROLE_WRITER;
-            client->owner = NULL;  /* Handler coroutine will use suspenders_running */
             return true;
         }
         int err = suspenders_sock_errno();
@@ -1671,7 +1668,7 @@ static bool unix_accept(hose_t *listener, hose_t *client) {
 
 static ssize_t unix_read(hose_t *h, void *dest, size_t len) {
     if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_recv(h->fd, dest, len, 0);
         if (n >= 0) return n;
@@ -1686,7 +1683,7 @@ static ssize_t unix_read(hose_t *h, void *dest, size_t len) {
 
 static ssize_t unix_write(hose_t *h, const void *src, size_t len) {
     if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
-    suspenders_cr_t *cr = h->owner ? h->owner : suspenders_running;
+    suspenders_cr_t *cr = suspenders_running;
     size_t written = 0;
     while (written < len) {
         ssize_t n = suspenders_sock_send(h->fd, (const char*)src + written, len - written, 0);
@@ -1767,7 +1764,6 @@ void hose_init(hose_t *d, struct buf *b) {
     memset(d, 0, sizeof(*d));
     d->fd = SUSPENDERS_INVALID_SOCK;
     d->buffer = b;
-    d->owner = suspenders_running;
 }
 
 bool hose_dial(hose_t *d, const char *uri) {
