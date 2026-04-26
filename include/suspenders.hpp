@@ -26,9 +26,7 @@
  *   ctx.run();
  */
 
-extern "C" {
 #include "suspenders.h"
-}
 
 #include <memory>
 #include <string>
@@ -42,6 +40,7 @@ extern "C" {
 #include <cassert>
 #include <cstring>
 #include <iterator>
+#include <chrono>
 
 namespace suspenders {
 
@@ -127,6 +126,111 @@ public:
 };
 
 // ============================================================================
+// Timer (RAII wrapper around suspenders_timer_t)
+// ============================================================================
+
+class Timer {
+    suspenders_timer_t* t_ = nullptr;
+    void* arg_ = nullptr;
+    
+    static void trampoline(void* arg) {
+        auto* cb = static_cast<std::function<void()>*>(arg);
+        (*cb)();
+    }
+    
+public:
+    Timer() = default;
+    
+    Timer(int ms, bool repeat, std::function<void()> cb) {
+        auto* ptr = new std::function<void()>(std::move(cb));
+        t_ = suspenders_timer_create(ms, repeat, trampoline, ptr);
+        if (!t_) {
+            delete ptr;
+            throw std::runtime_error("suspenders::Timer: failed to create timer");
+        }
+        arg_ = ptr;
+    }
+    
+    ~Timer() {
+        cancel();
+    }
+    
+    Timer(Timer&& other) noexcept 
+        : t_(other.t_), arg_(other.arg_) 
+    {
+        other.t_ = nullptr;
+        other.arg_ = nullptr;
+    }
+    
+    Timer& operator=(Timer&& other) noexcept {
+        if (this != &other) {
+            cancel();
+            t_ = other.t_;
+            arg_ = other.arg_;
+            other.t_ = nullptr;
+            other.arg_ = nullptr;
+        }
+        return *this;
+    }
+    
+    Timer(const Timer&) = delete;
+    Timer& operator=(const Timer&) = delete;
+    
+    void cancel() {
+        if (t_) {
+            suspenders_timer_cancel(t_);
+            t_ = nullptr;
+        }
+        if (arg_) {
+            delete static_cast<std::function<void()>*>(arg_);
+            arg_ = nullptr;
+        }
+    }
+    
+    [[nodiscard]] bool valid() const { return t_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+};
+
+// ============================================================================
+// Ticket Lock (RAII lock guard)
+// ============================================================================
+
+class TicketLock {
+    suspenders_ticket_lock_t lock_;
+    
+public:
+    TicketLock() {
+        suspenders_ticket_init(&lock_);
+    }
+    
+    void lock() {
+        suspenders_ticket_lock(&lock_);
+    }
+    
+    void unlock() {
+        suspenders_ticket_unlock(&lock_);
+    }
+    
+    class Guard {
+        TicketLock* lock_;
+    public:
+        explicit Guard(TicketLock& lock) : lock_(&lock) { lock_->lock(); }
+        ~Guard() { if (lock_) lock_->unlock(); }
+        Guard(Guard&& other) noexcept : lock_(other.lock_) { other.lock_ = nullptr; }
+        Guard& operator=(Guard&& other) noexcept {
+            if (this != &other) {
+                if (lock_) lock_->unlock();
+                lock_ = other.lock_;
+                other.lock_ = nullptr;
+            }
+            return *this;
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+    };
+};
+
+// ============================================================================
 // Type-Safe Channel (zero-copy rendezvous)
 // ============================================================================
 
@@ -199,13 +303,12 @@ class Hose {
     
 public:
     Hose() {
-        memset(&hose_, 0, sizeof(hose_));
-        hose_.fd = SUSPENDERS_INVALID_SOCK;
+        hose_init(&hose_, nullptr);
+        valid_ = true;
     }
     
     explicit Hose(struct buf* buffer) : Hose() {
-        hose_init(&hose_, buffer);
-        valid_ = true;
+        hose_.buffer = buffer;
     }
     
     ~Hose() {
@@ -251,7 +354,7 @@ public:
         if (!valid_) return false;
         hose_t client_hose;
         if (hose_accept(&hose_, &client_hose)) {
-            client = Hose();
+            client.close();
             client.hose_ = client_hose;
             client.valid_ = true;
             return true;
@@ -313,11 +416,11 @@ public:
     Buffer() = default;
     
     explicit Buffer(std::string_view initial) : Buffer() {
-        append(initial);
+        (void)append(initial);
     }
     
     explicit Buffer(const void* data, size_t len) : Buffer() {
-        append(data, len);
+        (void)append(data, len);
     }
     
     ~Buffer() {
@@ -412,6 +515,117 @@ public:
 };
 
 // ============================================================================
+// Dispatch Queue (serial task queue)
+// ============================================================================
+
+class DispatchQueue {
+    suspenders_dispatch_queue_t* q_ = nullptr;
+    
+    static void trampoline(void* arg) {
+        auto* cb = static_cast<std::function<void()>*>(arg);
+        (*cb)();
+        delete cb;
+    }
+    
+public:
+    DispatchQueue() = default;
+    
+    explicit DispatchQueue(const char* label, QoS qos = QoS::Normal) {
+        q_ = suspenders_dispatch_queue_create(label, static_cast<suspenders_qos_t>(qos));
+        if (!q_) throw std::runtime_error("suspenders::DispatchQueue: failed to create queue");
+    }
+    
+    ~DispatchQueue() {
+        if (q_) suspenders_dispatch_queue_destroy(q_);
+    }
+    
+    DispatchQueue(DispatchQueue&& other) noexcept : q_(other.q_) {
+        other.q_ = nullptr;
+    }
+    
+    DispatchQueue& operator=(DispatchQueue&& other) noexcept {
+        if (this != &other) {
+            if (q_) suspenders_dispatch_queue_destroy(q_);
+            q_ = other.q_;
+            other.q_ = nullptr;
+        }
+        return *this;
+    }
+    
+    DispatchQueue(const DispatchQueue&) = delete;
+    DispatchQueue& operator=(const DispatchQueue&) = delete;
+    
+    template<typename F>
+    void async(F&& f) {
+        if (!q_) return;
+        auto* ptr = new std::function<void()>(std::forward<F>(f));
+        suspenders_dispatch_async(q_, trampoline, ptr);
+    }
+    
+    template<typename F>
+    void barrier_async(F&& f) {
+        if (!q_) return;
+        auto* ptr = new std::function<void()>(std::forward<F>(f));
+        suspenders_dispatch_barrier_async(q_, trampoline, ptr);
+    }
+    
+    [[nodiscard]] bool valid() const { return q_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+};
+
+// ============================================================================
+// Coroutine Pool (N workers consuming a shared task channel)
+// ============================================================================
+
+class Pool {
+    suspenders_pool_t* pool_ = nullptr;
+    
+    static void trampoline(void* arg) {
+        auto* cb = static_cast<std::function<void()>*>(arg);
+        (*cb)();
+        delete cb;
+    }
+    
+public:
+    Pool() = default;
+    
+    explicit Pool(unsigned nworkers, QoS qos = QoS::Normal) {
+        pool_ = suspenders_pool_create(nworkers, static_cast<suspenders_qos_t>(qos));
+        if (!pool_) throw std::runtime_error("suspenders::Pool: failed to create pool");
+    }
+    
+    ~Pool() {
+        if (pool_) suspenders_pool_destroy(pool_);
+    }
+    
+    Pool(Pool&& other) noexcept : pool_(other.pool_) {
+        other.pool_ = nullptr;
+    }
+    
+    Pool& operator=(Pool&& other) noexcept {
+        if (this != &other) {
+            if (pool_) suspenders_pool_destroy(pool_);
+            pool_ = other.pool_;
+            other.pool_ = nullptr;
+        }
+        return *this;
+    }
+    
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
+    
+    template<typename F>
+    void submit(F&& f) {
+        if (!pool_) return;
+        auto* ptr = new std::function<void()>(std::forward<F>(f));
+        suspenders_pool_submit(pool_, trampoline, ptr);
+    }
+    
+    [[nodiscard]] bool valid() const { return pool_ != nullptr; }
+    explicit operator bool() const { return valid(); }
+};
+
+// ============================================================================
 // Coroutine Spawning (Lambda Support)
 // ============================================================================
 
@@ -465,8 +679,17 @@ inline void suspend() {
 }
 
 inline void sleep_ms(int ms) {
-    (void)ms;
-    yield();
+    if (ms > 0) suspenders_sleep_ns(static_cast<uint64_t>(ms) * 1000000ULL);
+}
+
+template<typename Rep, typename Period>
+inline void sleep_for(std::chrono::duration<Rep, Period> duration) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    if (ns > 0) suspenders_sleep_ns(static_cast<uint64_t>(ns));
+}
+
+inline uint64_t now_ns() {
+    return suspenders_now_ns();
 }
 
 // ============================================================================

@@ -5,8 +5,49 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+
+/* ============================================================================
+ * Atomic abstraction - C11 _Atomic in C, std::atomic in C++
+ * ============================================================================ */
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<int>           suspenders_atomic_int;
+typedef std::atomic<uint32_t>      suspenders_atomic_u32;
+typedef std::atomic<size_t>        suspenders_atomic_size_t;
+typedef std::atomic<uintptr_t>     suspenders_atomic_uintptr_t;
+
+#define SUSPENDERS_MEMORY_ORDER_RELAXED std::memory_order_relaxed
+#define SUSPENDERS_MEMORY_ORDER_ACQUIRE std::memory_order_acquire
+#define SUSPENDERS_MEMORY_ORDER_RELEASE std::memory_order_release
+
+#define suspenders_atomic_init(x, val)                 ((x) = (val))
+#define suspenders_atomic_load(x, order)               ((x).load(order))
+#define suspenders_atomic_store(x, val, order)         ((x).store((val), (order)))
+#define suspenders_atomic_fetch_add(x, val, order)     ((x).fetch_add((val), (order)))
+#define suspenders_atomic_fetch_sub(x, val, order)     ((x).fetch_sub((val), (order)))
+#define suspenders_atomic_compare_exchange_weak(x, expected, desired) \
+    ((x).compare_exchange_weak((expected), (desired)))
+#else
+#include <stdatomic.h>
+typedef _Atomic int                suspenders_atomic_int;
+typedef _Atomic uint32_t           suspenders_atomic_u32;
+typedef _Atomic size_t             suspenders_atomic_size_t;
+typedef _Atomic uintptr_t          suspenders_atomic_uintptr_t;
+
+#define SUSPENDERS_MEMORY_ORDER_RELAXED memory_order_relaxed
+#define SUSPENDERS_MEMORY_ORDER_ACQUIRE memory_order_acquire
+#define SUSPENDERS_MEMORY_ORDER_RELEASE memory_order_release
+
+#define suspenders_atomic_init(x, val)                 atomic_init(&(x), (val))
+#define suspenders_atomic_load(x, order)               atomic_load_explicit(&(x), (order))
+#define suspenders_atomic_store(x, val, order)         atomic_store_explicit(&(x), (val), (order))
+#define suspenders_atomic_fetch_add(x, val, order)     atomic_fetch_add_explicit(&(x), (val), (order))
+#define suspenders_atomic_fetch_sub(x, val, order)     atomic_fetch_sub_explicit(&(x), (val), (order))
+#define suspenders_atomic_compare_exchange_weak(x, expected, desired) \
+    atomic_compare_exchange_weak(&(x), &(expected), (desired))
+#endif
 
 /* ============================================================================
  * Platform Detection
@@ -84,7 +125,7 @@ typedef struct memento_thread_heap_s memento_thread_heap_t;
  * BUFFER - Memento-backed dynamic buffer
  * ============================================================================ */
 #ifndef BUF_MALLOC
-#define BUF_MALLOC(size) memento_thread_heap_alloc(memento_thread_heap_get(), size)
+#define BUF_MALLOC(size) ((char*)memento_thread_heap_alloc(memento_thread_heap_get(), size))
 #endif
 #ifndef BUF_FREE
 #define BUF_FREE(ptr, size) memento_thread_heap_free(memento_thread_heap_get(), ptr, size)
@@ -195,7 +236,7 @@ typedef struct suspenders_wq_node_s {
 typedef struct suspenders_cr_s {
     suspenders_ctx_t      ctx;
     suspenders_state_t    state;
-    _Atomic int      effective_qos;
+    suspenders_atomic_int effective_qos;
     int              base_qos;
     memento_arena_t *arena;       /* Stack arena */
     suspenders_wq_node_t  wq_node;
@@ -205,8 +246,8 @@ typedef struct suspenders_cr_s {
 
 /* Ticket lock - strict FIFO ordering */
 typedef struct {
-    _Atomic uint32_t next_ticket;
-    _Atomic uint32_t now_serving;
+    suspenders_atomic_u32 next_ticket;
+    suspenders_atomic_u32 now_serving;
 } SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_ticket_lock_t;
 
 static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l);
@@ -217,7 +258,7 @@ static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l);
 typedef struct {
     size_t elem_sz;
     size_t buf_sz;
-    _Atomic size_t count;
+    suspenders_atomic_size_t count;
     suspenders_wq_node_t *senders;
     suspenders_wq_node_t *receivers;
     suspenders_ticket_lock_t lock;
@@ -244,6 +285,10 @@ typedef struct suspenders_transport_ops {
     ssize_t (*sendto)(hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen);
     void (*close)(hose_t *h);
 } suspenders_transport_ops_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 bool suspenders_transport_register(const suspenders_transport_ops_t *ops);
 const suspenders_transport_ops_t* suspenders_transport_find(const char *scheme);
@@ -289,6 +334,32 @@ void suspenders_resume(suspenders_cr_t *cr);
 void suspenders_boost(suspenders_cr_t *target, suspenders_qos_t new_qos);
 void suspenders_cancel(suspenders_cr_t *cr);
 
+/* Timers and monotonic clock */
+typedef struct suspenders_timer_s suspenders_timer_t;
+suspenders_timer_t* suspenders_timer_create(int ms, bool repeat,
+                                            void (*cb)(void*), void *arg);
+void suspenders_timer_cancel(suspenders_timer_t *t);
+uint64_t suspenders_now_ns(void);
+void suspenders_sleep_ns(uint64_t ns);
+
+/* Dispatch queue and coroutine pool */
+typedef struct suspenders_dispatch_queue_s suspenders_dispatch_queue_t;
+typedef struct suspenders_pool_s suspenders_pool_t;
+
+suspenders_dispatch_queue_t* suspenders_dispatch_queue_create(const char *label,
+                                                               suspenders_qos_t qos);
+void suspenders_dispatch_queue_destroy(suspenders_dispatch_queue_t *q);
+void suspenders_dispatch_async(suspenders_dispatch_queue_t *q,
+                               void (*fn)(void*), void *arg);
+void suspenders_dispatch_barrier_async(suspenders_dispatch_queue_t *q,
+                                       void (*fn)(void*), void *arg);
+
+suspenders_pool_t* suspenders_pool_create(unsigned nworkers,
+                                          suspenders_qos_t qos);
+void suspenders_pool_destroy(suspenders_pool_t *pool);
+void suspenders_pool_submit(suspenders_pool_t *pool,
+                            void (*fn)(void*), void *arg);
+
 suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz);
 bool suspenders_chan_send(suspenders_chan_t *ch, void *val);
 bool suspenders_chan_recv(suspenders_chan_t *ch, void *out);
@@ -314,6 +385,10 @@ static inline void hose_init_legacy(hose_t *d, void *ring, struct buf *b) {
 void suspenders_writev_async(int fd, struct iovec *iovs, int count);
 #endif
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* LIBSUSPENDERS_H */
 
 
@@ -331,8 +406,8 @@ static suspenders_cr_t *suspenders_main_cr = NULL;
 static __thread suspenders_cr_t *ready_queue_heads[SUSPENDERS_QOS_COUNT] = {0};
 static __thread suspenders_cr_t *ready_queue_tails[SUSPENDERS_QOS_COUNT] = {0};
 static __thread int suspenders_initialized = 0;
-static _Atomic int active_coroutines = 0;
-static suspenders_cr_t *zombie_head = NULL;
+static suspenders_atomic_int active_coroutines = 0;
+static suspenders_atomic_uintptr_t zombie_head = 0;
 
 /* Backend instance */
 static __thread struct suspenders_backend_s *suspenders_backend = NULL;
@@ -436,6 +511,9 @@ static inline int suspenders_sock_errno(void) {
 /* ============================================================================
  * COROUTINE EXIT HANDLER
  * ============================================================================ */
+#ifdef __cplusplus
+extern "C"
+#endif
 void suspenders_cr_exit(void);
 
 /* ============================================================================
@@ -521,7 +599,13 @@ __asm__(
 #endif
 );
 
+#ifdef __cplusplus
+extern "C"
+#endif
 void _suspenders_asm_switch(suspenders_ctx_t *old, suspenders_ctx_t *new_ctx);
+#ifdef __cplusplus
+extern "C"
+#endif
 void _suspenders_asm_entry(void);
 
 static inline void suspenders_make_context(suspenders_ctx_t *ctx, void *stack_base, size_t stack_size,
@@ -603,7 +687,13 @@ __asm__(
 #endif
 );
 
+#ifdef __cplusplus
+extern "C"
+#endif
 void _suspenders_asm_switch(suspenders_ctx_t *old, suspenders_ctx_t *new_ctx);
+#ifdef __cplusplus
+extern "C"
+#endif
 void _suspenders_asm_entry(void);
 
 static inline void suspenders_make_context(suspenders_ctx_t *ctx, void *stack_base, size_t stack_size,
@@ -627,19 +717,18 @@ static inline void suspenders_ctx_switch(suspenders_ctx_t *old, suspenders_ctx_t
  * COROUTINE EXIT HANDLER
  * ============================================================================ */
 static inline void suspenders_zombie_enqueue(suspenders_cr_t *cr) {
-    suspenders_cr_t *old_head;
+    uintptr_t old_head;
     do {
-        old_head = zombie_head;
-        cr->next = old_head;
-    } while (!atomic_compare_exchange_weak((atomic_uintptr_t*)&zombie_head,
-                                            (uintptr_t*)&old_head, (uintptr_t)cr));
+        old_head = suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED);
+        cr->next = (suspenders_cr_t*)old_head;
+    } while (!suspenders_atomic_compare_exchange_weak(zombie_head, old_head, (uintptr_t)cr));
 }
 
 void suspenders_cr_exit(void) {
     if (suspenders_running) {
         if (suspenders_running->state != SUSPENDERS_STATE_DONE) {
             suspenders_running->state = SUSPENDERS_STATE_DONE;
-            atomic_fetch_sub(&active_coroutines, 1);
+            suspenders_atomic_fetch_sub(active_coroutines, 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
         }
         suspenders_zombie_enqueue(suspenders_running);
         if (suspenders_main_cr) {
@@ -653,14 +742,14 @@ void suspenders_cr_exit(void) {
  * TICKET LOCK
  * ============================================================================ */
 static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l) {
-    atomic_init(&l->next_ticket, 0);
-    atomic_init(&l->now_serving, 0);
+    suspenders_atomic_init(l->next_ticket, 0);
+    suspenders_atomic_init(l->now_serving, 0);
 }
 
 static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l) {
-    uint32_t my_ticket = atomic_fetch_add_explicit(&l->next_ticket, 1,
-                                                    memory_order_relaxed);
-    while (atomic_load_explicit(&l->now_serving, memory_order_acquire) != my_ticket) {
+    uint32_t my_ticket = suspenders_atomic_fetch_add(l->next_ticket, 1,
+                                                    SUSPENDERS_MEMORY_ORDER_RELAXED);
+    while (suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_ACQUIRE) != my_ticket) {
 #if defined(SUSPENDERS_ARCH_X86_64)
         __builtin_ia32_pause();
 #elif defined(SUSPENDERS_ARCH_AARCH64)
@@ -670,8 +759,8 @@ static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l) {
 }
 
 static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l) {
-    uint32_t current = atomic_load_explicit(&l->now_serving, memory_order_relaxed);
-    atomic_store_explicit(&l->now_serving, current + 1, memory_order_release);
+    uint32_t current = suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    suspenders_atomic_store(l->now_serving, current + 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
 }
 
 /* ============================================================================
@@ -748,10 +837,11 @@ void suspenders_resume(suspenders_cr_t *cr) {
 
 void suspenders_boost(suspenders_cr_t *target, suspenders_qos_t new_qos) {
     if (SUSPENDERS_UNLIKELY(!target)) return;
-    int current = atomic_load(&target->effective_qos);
+    int current = suspenders_atomic_load(target->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
     while ((int)new_qos < current) {
-        if (atomic_compare_exchange_weak(&target->effective_qos, &current, (int)new_qos))
+        if (suspenders_atomic_compare_exchange_weak(target->effective_qos, current, (int)new_qos))
             break;
+        current = suspenders_atomic_load(target->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
     }
 }
 
@@ -766,7 +856,7 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
     if (SUSPENDERS_UNLIKELY(!func)) return NULL;
 
     if (SUSPENDERS_UNLIKELY(!suspenders_main_cr)) {
-        suspenders_main_cr = memento_thread_heap_alloc(memento_thread_heap_get(),
+        suspenders_main_cr = (suspenders_cr_t*)memento_thread_heap_alloc(memento_thread_heap_get(),
                                                    sizeof(suspenders_cr_t));
         if (SUSPENDERS_UNLIKELY(!suspenders_main_cr)) return NULL;
         memset(suspenders_main_cr, 0, sizeof(suspenders_cr_t));
@@ -782,7 +872,7 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
 #endif
     }
 
-    suspenders_cr_t *cr = memento_thread_heap_alloc(memento_thread_heap_get(),
+    suspenders_cr_t *cr = (suspenders_cr_t*)memento_thread_heap_alloc(memento_thread_heap_get(),
                                                 sizeof(suspenders_cr_t));
     if (SUSPENDERS_UNLIKELY(!cr)) return NULL;
     memset(cr, 0, sizeof(suspenders_cr_t));
@@ -810,7 +900,7 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
 #endif
 
     suspenders_ready_enqueue(cr);
-    atomic_fetch_add(&active_coroutines, 1);
+    suspenders_atomic_fetch_add(active_coroutines, 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
 
     return cr;
 }
@@ -819,7 +909,7 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
  * CHANNEL - Zero-copy rendezvous
  * ============================================================================ */
 suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz) {
-    suspenders_chan_t *ch = memento_thread_heap_alloc(memento_thread_heap_get(),
+    suspenders_chan_t *ch = (suspenders_chan_t*)memento_thread_heap_alloc(memento_thread_heap_get(),
                                                   sizeof(suspenders_chan_t));
     if (SUSPENDERS_UNLIKELY(!ch)) return NULL;
     memset(ch, 0, sizeof(*ch));
@@ -990,9 +1080,8 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
         }
         io_uring_cqe_seen(&be->ring, cqe);
     }
-    return found;
 
-    if (timeout_ms == 0) return 0;
+    if (found || timeout_ms == 0) return found;
 
     /* Block for at least one CQE */
     int ret;
@@ -1015,9 +1104,9 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
 
         /* Drain additional CQEs */
         io_uring_for_each_cqe(&be->ring, head, cqe) {
-        suspenders_cr_t *cr = (suspenders_cr_t*)io_uring_cqe_get_data(cqe);
+            suspenders_cr_t *cr = (suspenders_cr_t*)io_uring_cqe_get_data(cqe);
             if (cr && cr->state == SUSPENDERS_STATE_SUSPENDED) {
-            cr->io_result = cqe->res;
+                cr->io_result = cqe->res;
                 suspenders_ready_enqueue(cr);
                 found++;
             }
@@ -1849,6 +1938,324 @@ const suspenders_transport_ops_t* suspenders_transport_find(const char *scheme) 
 
 
 /* ============================================================================
+ * TIMERS
+ * ============================================================================ */
+struct suspenders_timer_s {
+    uint64_t deadline_ns;
+    int period_ms;
+    bool repeat;
+    bool active;
+    void (*cb)(void*);
+    void *arg;
+};
+
+typedef struct {
+    suspenders_timer_t **data;
+    size_t count;
+    size_t cap;
+} suspenders_timer_heap_t;
+
+static __thread suspenders_timer_heap_t suspenders_timer_heap = {0};
+
+static bool suspenders_timer_heap_ensure_cap(suspenders_timer_heap_t *h, size_t needed) {
+    if (needed <= h->cap) return true;
+    size_t new_cap = h->cap ? h->cap * 2 : 16;
+    while (new_cap < needed) new_cap *= 2;
+    suspenders_timer_t **new_data = (suspenders_timer_t**)realloc(h->data, new_cap * sizeof(*new_data));
+    if (!new_data) return false;
+    h->data = new_data;
+    h->cap = new_cap;
+    return true;
+}
+
+static void suspenders_timer_heap_swap(suspenders_timer_t **a, suspenders_timer_t **b) {
+    suspenders_timer_t *tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static void suspenders_timer_heap_sift_up(suspenders_timer_heap_t *h, size_t idx) {
+    while (idx > 0) {
+        size_t parent = (idx - 1) / 2;
+        if (h->data[parent]->deadline_ns <= h->data[idx]->deadline_ns) break;
+        suspenders_timer_heap_swap(&h->data[parent], &h->data[idx]);
+        idx = parent;
+    }
+}
+
+static void suspenders_timer_heap_sift_down(suspenders_timer_heap_t *h, size_t idx) {
+    size_t n = h->count;
+    while (1) {
+        size_t left = idx * 2 + 1;
+        size_t right = idx * 2 + 2;
+        size_t smallest = idx;
+        if (left < n && h->data[left]->deadline_ns < h->data[smallest]->deadline_ns)
+            smallest = left;
+        if (right < n && h->data[right]->deadline_ns < h->data[smallest]->deadline_ns)
+            smallest = right;
+        if (smallest == idx) break;
+        suspenders_timer_heap_swap(&h->data[idx], &h->data[smallest]);
+        idx = smallest;
+    }
+}
+
+static bool suspenders_timer_heap_push(suspenders_timer_t *t) {
+    suspenders_timer_heap_t *h = &suspenders_timer_heap;
+    if (!suspenders_timer_heap_ensure_cap(h, h->count + 1)) return false;
+    h->data[h->count] = t;
+    h->count++;
+    suspenders_timer_heap_sift_up(h, h->count - 1);
+    return true;
+}
+
+static suspenders_timer_t* suspenders_timer_heap_pop(void) {
+    suspenders_timer_heap_t *h = &suspenders_timer_heap;
+    if (h->count == 0) return NULL;
+    suspenders_timer_t *t = h->data[0];
+    h->data[0] = h->data[h->count - 1];
+    h->count--;
+    if (h->count > 0) suspenders_timer_heap_sift_down(h, 0);
+    return t;
+}
+
+static void suspenders_timer_heap_remove(suspenders_timer_t *t) {
+    suspenders_timer_heap_t *h = &suspenders_timer_heap;
+    for (size_t i = 0; i < h->count; i++) {
+        if (h->data[i] == t) {
+            h->data[i] = h->data[h->count - 1];
+            h->count--;
+            if (i < h->count) {
+                suspenders_timer_heap_sift_down(h, i);
+                suspenders_timer_heap_sift_up(h, i);
+            }
+            break;
+        }
+    }
+}
+
+uint64_t suspenders_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+suspenders_timer_t* suspenders_timer_create(int ms, bool repeat,
+                                            void (*cb)(void*), void *arg) {
+    if (ms <= 0 || !cb) return NULL;
+    suspenders_timer_t *t = (suspenders_timer_t*)malloc(sizeof(*t));
+    if (!t) return NULL;
+    t->deadline_ns = suspenders_now_ns() + (uint64_t)ms * 1000000ULL;
+    t->period_ms = ms;
+    t->repeat = repeat;
+    t->active = true;
+    t->cb = cb;
+    t->arg = arg;
+    if (!suspenders_timer_heap_push(t)) {
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+void suspenders_timer_cancel(suspenders_timer_t *t) {
+    if (!t || !t->active) return;
+    t->active = false;
+    suspenders_timer_heap_remove(t);
+    free(t);
+}
+
+static void suspenders_timer_fire_expired(void) {
+    suspenders_timer_heap_t *h = &suspenders_timer_heap;
+    uint64_t now = suspenders_now_ns();
+    while (h->count > 0 && h->data[0]->deadline_ns <= now) {
+        suspenders_timer_t *t = suspenders_timer_heap_pop();
+        if (!t || !t->active) {
+            free(t);
+            continue;
+        }
+        if (t->repeat) {
+            t->deadline_ns = now + (uint64_t)t->period_ms * 1000000ULL;
+            if (!suspenders_timer_heap_push(t)) {
+                t->active = false;
+            }
+        } else {
+            t->active = false;
+        }
+        void (*cb)(void*) = t->cb;
+        void *arg = t->arg;
+        if (cb) cb(arg);
+    }
+}
+
+static void suspenders_sleep_cb(void *arg) {
+    suspenders_resume((suspenders_cr_t*)arg);
+}
+
+void suspenders_sleep_ns(uint64_t ns) {
+    if (!suspenders_running || ns == 0) return;
+    int ms = (int)(ns / 1000000);
+    if (ms < 1) ms = 1;
+    suspenders_timer_t *t = suspenders_timer_create(ms, false, suspenders_sleep_cb, suspenders_running);
+    if (!t) return;
+    suspenders_suspend();
+    suspenders_timer_cancel(t);
+}
+
+/* ============================================================================
+ * DISPATCH QUEUE AND COROUTINE POOL
+ * ============================================================================ */
+typedef struct {
+    void (*fn)(void*);
+    void *arg;
+} suspenders_task_t;
+
+static void suspenders_chan_destroy(suspenders_chan_t *ch) {
+    if (!ch) return;
+    memento_thread_heap_free(memento_thread_heap_get(), ch, sizeof(*ch));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Dispatch queue (serial task queue)                                         */
+/* -------------------------------------------------------------------------- */
+struct suspenders_dispatch_queue_s {
+    char label[64];
+    suspenders_chan_t *chan;
+    suspenders_cr_t *worker;
+    bool shutdown;
+};
+
+static void suspenders_dispatch_worker(void *arg) {
+    suspenders_dispatch_queue_t *q = (suspenders_dispatch_queue_t*)arg;
+    while (!q->shutdown) {
+        suspenders_task_t task;
+        memset(&task, 0, sizeof(task));
+        if (!suspenders_chan_recv(q->chan, &task)) continue;
+        if (!task.fn) break; /* sentinel */
+        task.fn(task.arg);
+    }
+}
+
+suspenders_dispatch_queue_t* suspenders_dispatch_queue_create(const char *label,
+                                                               suspenders_qos_t qos) {
+    suspenders_dispatch_queue_t *q = (suspenders_dispatch_queue_t*)malloc(sizeof(*q));
+    if (!q) return NULL;
+    memset(q, 0, sizeof(*q));
+    if (label) {
+        strncpy(q->label, label, sizeof(q->label) - 1);
+        q->label[sizeof(q->label) - 1] = '\0';
+    }
+    q->chan = suspenders_chan_create(sizeof(suspenders_task_t), 0);
+    if (!q->chan) {
+        free(q);
+        return NULL;
+    }
+    q->worker = suspenders_spawn(suspenders_dispatch_worker, q, qos);
+    if (!q->worker) {
+        suspenders_chan_destroy(q->chan);
+        free(q);
+        return NULL;
+    }
+    return q;
+}
+
+void suspenders_dispatch_queue_destroy(suspenders_dispatch_queue_t *q) {
+    if (!q) return;
+    q->shutdown = true;
+    if (q->worker) suspenders_cancel(q->worker);
+    suspenders_chan_destroy(q->chan);
+    free(q);
+}
+
+void suspenders_dispatch_async(suspenders_dispatch_queue_t *q,
+                               void (*fn)(void*), void *arg) {
+    if (!q || q->shutdown || !fn) return;
+    suspenders_task_t task = {fn, arg};
+    suspenders_chan_send(q->chan, &task);
+}
+
+void suspenders_dispatch_barrier_async(suspenders_dispatch_queue_t *q,
+                                       void (*fn)(void*), void *arg) {
+    /* Serial queue: tasks are already executed in submission order, so a
+     * barrier is equivalent to a normal async submission. */
+    suspenders_dispatch_async(q, fn, arg);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Coroutine pool (N workers consuming a shared task channel)                 */
+/* -------------------------------------------------------------------------- */
+struct suspenders_pool_s {
+    suspenders_chan_t *chan;
+    unsigned nworkers;
+    suspenders_cr_t **workers;
+    bool shutdown;
+};
+
+static void suspenders_pool_worker(void *arg) {
+    suspenders_pool_t *pool = (suspenders_pool_t*)arg;
+    while (!pool->shutdown) {
+        suspenders_task_t task;
+        memset(&task, 0, sizeof(task));
+        if (!suspenders_chan_recv(pool->chan, &task)) continue;
+        if (!task.fn) break; /* sentinel */
+        task.fn(task.arg);
+    }
+}
+
+suspenders_pool_t* suspenders_pool_create(unsigned nworkers,
+                                          suspenders_qos_t qos) {
+    if (nworkers == 0) nworkers = 1;
+    suspenders_pool_t *pool = (suspenders_pool_t*)malloc(sizeof(*pool));
+    if (!pool) return NULL;
+    memset(pool, 0, sizeof(*pool));
+    pool->nworkers = nworkers;
+    pool->chan = suspenders_chan_create(sizeof(suspenders_task_t), 0);
+    if (!pool->chan) {
+        free(pool);
+        return NULL;
+    }
+    pool->workers = (suspenders_cr_t**)malloc(nworkers * sizeof(suspenders_cr_t*));
+    if (!pool->workers) {
+        suspenders_chan_destroy(pool->chan);
+        free(pool);
+        return NULL;
+    }
+    for (unsigned i = 0; i < nworkers; i++) {
+        pool->workers[i] = suspenders_spawn(suspenders_pool_worker, pool, qos);
+        if (!pool->workers[i]) {
+            pool->shutdown = true;
+            for (unsigned j = 0; j < i; j++) {
+                suspenders_task_t sentinel;
+                memset(&sentinel, 0, sizeof(sentinel));
+                suspenders_chan_send(pool->chan, &sentinel);
+            }
+            suspenders_chan_destroy(pool->chan);
+            free(pool->workers);
+            free(pool);
+            return NULL;
+        }
+    }
+    return pool;
+}
+
+void suspenders_pool_destroy(suspenders_pool_t *pool) {
+    if (!pool) return;
+    pool->shutdown = true;
+    for (unsigned i = 0; i < pool->nworkers; i++) {
+        if (pool->workers[i]) suspenders_cancel(pool->workers[i]);
+    }
+    suspenders_chan_destroy(pool->chan);
+    free(pool->workers);
+    free(pool);
+}
+
+void suspenders_pool_submit(suspenders_pool_t *pool,
+                            void (*fn)(void*), void *arg) {
+    if (!pool || pool->shutdown || !fn) return;
+    suspenders_task_t task = {fn, arg};
+    suspenders_chan_send(pool->chan, &task);
+}
+
+/* ============================================================================
  * SCHEDULER INITIALIZATION & LIFECYCLE
  * ============================================================================ */
 void suspenders_init(unsigned num_workers, unsigned queue_hint) {
@@ -1889,7 +2296,7 @@ void suspenders_run(void) {
     }
 
     if (SUSPENDERS_UNLIKELY(!suspenders_main_cr)) {
-        suspenders_main_cr = memento_thread_heap_alloc(memento_thread_heap_get(),
+        suspenders_main_cr = (suspenders_cr_t*)memento_thread_heap_alloc(memento_thread_heap_get(),
                                                    sizeof(suspenders_cr_t));
         if (SUSPENDERS_UNLIKELY(!suspenders_main_cr)) {
             fprintf(stderr, "suspenders: failed to create main coroutine\n");
@@ -1920,9 +2327,9 @@ void suspenders_run(void) {
             continue;
         }
 
-        while (zombie_head) {
-            suspenders_cr_t *zombie = zombie_head;
-            zombie_head = zombie->next;
+        while (suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED)) {
+            suspenders_cr_t *zombie = (suspenders_cr_t*)suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED);
+            suspenders_atomic_store(zombie_head, (uintptr_t)zombie->next, SUSPENDERS_MEMORY_ORDER_RELAXED);
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
             if (zombie->ctx.fiber && zombie->ctx.fiber != suspenders_main_fiber) {
                 DeleteFiber(zombie->ctx.fiber);
@@ -1934,12 +2341,34 @@ void suspenders_run(void) {
             memento_thread_heap_free(memento_thread_heap_get(), zombie, sizeof(suspenders_cr_t));
         }
 
-        if (suspenders_ready_queue_empty() && atomic_load(&active_coroutines) == 0) {
+        if (suspenders_ready_queue_empty() &&
+            suspenders_atomic_load(active_coroutines, SUSPENDERS_MEMORY_ORDER_RELAXED) == 0 &&
+            suspenders_timer_heap.count == 0) {
             break;
         }
 
-        if (suspenders_ready_queue_empty() && suspenders_backend) {
-            s_backend_wait(suspenders_backend, -1);
+        if (suspenders_ready_queue_empty()) {
+            int timeout_ms = -1;
+            if (suspenders_timer_heap.count > 0) {
+                uint64_t now = suspenders_now_ns();
+                uint64_t next = suspenders_timer_heap.data[0]->deadline_ns;
+                if (next <= now) {
+                    timeout_ms = 0;
+                } else {
+                    uint64_t delta_ns = next - now;
+                    timeout_ms = (int)(delta_ns / 1000000);
+                    if (timeout_ms < 1) timeout_ms = 1;
+                }
+            }
+            if (suspenders_backend) {
+                s_backend_wait(suspenders_backend, timeout_ms);
+            } else if (timeout_ms > 0) {
+                struct timespec ts;
+                ts.tv_sec = timeout_ms / 1000;
+                ts.tv_nsec = (timeout_ms % 1000) * 1000000LL;
+                nanosleep(&ts, NULL);
+            }
+            suspenders_timer_fire_expired();
         }
     }
 

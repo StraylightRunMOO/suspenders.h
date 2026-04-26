@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(libsuspenders VERSION 1.0.0 LANGUAGES C)
+project(libsuspenders VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -105,8 +105,9 @@ if(LIBURING_CFLAGS_OTHER)
     target_compile_options(suspenders-tests PRIVATE ${LIBURING_CFLAGS_OTHER})
 endif()
 
-# Add test
+# Add tests
 add_test(NAME suspenders_unit_tests COMMAND suspenders-tests)
+add_test(NAME simple COMMAND simple)
 
 # Benchmark executables
 add_executable(suspenders-benchmark benchmarks/benchmark_suspenders.c)
@@ -140,18 +141,25 @@ add_suspenders_executable(udp_echo examples)
 add_suspenders_executable(unix_echo examples)
 add_suspenders_executable(channel_demo examples)
 add_suspenders_executable(suspend_resume_demo examples)
+add_suspenders_executable(thread_pool examples)
+add_suspenders_executable(dispatch_demo examples)
+add_suspenders_executable(event_loop examples)
 
-# C++ example
-if(CMAKE_CXX_COMPILER)
-    enable_language(CXX)
-    add_executable(simple_cc examples/simple.cc)
-    set_target_properties(simple_cc PROPERTIES LINKER_LANGUAGE CXX)
-    target_include_directories(simple_cc PRIVATE ${SUSPENDERS_INCLUDE_DIRS})
-    target_link_libraries(simple_cc PRIVATE ${SUSPENDERS_LINK_LIBS})
+# C++ examples
+function(add_suspenders_cc_executable name source_dir)
+    add_executable(${name} ${source_dir}/${name}.cc)
+    set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
+    target_include_directories(${name} PRIVATE ${SUSPENDERS_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE ${SUSPENDERS_LINK_LIBS})
     if(LIBURING_CFLAGS_OTHER)
-        target_compile_options(simple_cc PRIVATE ${LIBURING_CFLAGS_OTHER})
+        target_compile_options(${name} PRIVATE ${LIBURING_CFLAGS_OTHER})
     endif()
-endif()
+endfunction()
+
+add_suspenders_cc_executable(simple_cc examples)
+add_suspenders_cc_executable(thread_pool_cc examples)
+add_suspenders_cc_executable(dispatch_demo_cc examples)
+add_suspenders_cc_executable(event_loop_cc examples)
 
 # Install targets
 install(TARGETS suspenders-demo DESTINATION bin)
