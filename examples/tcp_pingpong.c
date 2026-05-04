@@ -14,7 +14,9 @@
  *   ./tcp_pingpong
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,11 +45,11 @@ void signal_handler(int sig) {
 
 /* Server handler - echoes PONG for each PING received */
 void server_handler(void *arg) {
-    hose_t *client = (hose_t*)arg;
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char read_buf[1024];
 
     while (running) {
-        ssize_t n = hose_read(client, read_buf, sizeof(read_buf));
+        ssize_t n = suspenders_hose_read(client, read_buf, sizeof(read_buf));
         if (n <= 0) break;
 
         /* Append to the hose's internal buffer for stream reassembly */
@@ -55,7 +57,7 @@ void server_handler(void *arg) {
 
         /* Scan for complete PING messages and reply */
         while (client->buffer->data && strstr(client->buffer->data, "PING")) {
-            if (hose_write(client, "PONG\n", 5) <= 0) goto done;
+            if (suspenders_hose_write(client, "PONG\n", 5) <= 0) goto done;
             /* Find end of this message line */
             char *nl = strchr(client->buffer->data, '\n');
             if (nl) {
@@ -71,28 +73,28 @@ void server_handler(void *arg) {
         }
     }
 done:
-    hose_close(client);
+    suspenders_hose_close(client);
     if (client->buffer) {
         if (client->buffer->data)
             BUF_FREE(client->buffer->data, client->buffer->cap + 1);
         memento_thread_heap_free(memento_thread_heap_get(), client->buffer, sizeof(struct buf));
     }
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
 }
 
 void server_listener(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
     
-    if (!hose_listen(&listener, "tcp://0.0.0.0:12345")) return;
+    if (!suspenders_hose_listen(&listener, "tcp://0.0.0.0:12345")) return;
 
     while (running) {
         // Allocate via the memento-backed system
-        hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+        suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
         
-        if (!hose_accept(&listener, client)) {
-            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+        if (!suspenders_hose_accept(&listener, client)) {
+            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
             if (!running) break;
             continue;
         }
@@ -107,18 +109,18 @@ void server_listener(void *arg) {
 /* Client coroutine - sends PINGs and expects PONGs */
 void client_worker(void *arg) {
     int client_id = (int)(intptr_t)arg;
-    hose_t conn;
+    suspenders_hose_t conn;
     struct buf b = {0};
     char recv_buf[256];
     int pongs_received = 0;
 
-    hose_init(&conn, &b);
+    suspenders_hose_init(&conn, &b);
     
     /* Connect to server */
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", SERVER_PORT);
     
-    if (!hose_dial(&conn, uri)) {
+    if (!suspenders_hose_dial(&conn, uri)) {
         fprintf(stderr, "Client %d: Failed to connect to %s\n", client_id, uri);
         return;
     }
@@ -131,14 +133,14 @@ void client_worker(void *arg) {
         char ping_msg[64];
         snprintf(ping_msg, sizeof(ping_msg), "PING %d from client %d\n", i, client_id);
         
-        if (hose_write(&conn, ping_msg, strlen(ping_msg)) <= 0) {
+        if (suspenders_hose_write(&conn, ping_msg, strlen(ping_msg)) <= 0) {
             fprintf(stderr, "Client %d: Write failed\n", client_id);
             break;
         }
 
         /* Read PONG - auto-suspends until response arrives */
         memset(recv_buf, 0, sizeof(recv_buf));
-        ssize_t n = hose_read(&conn, recv_buf, sizeof(recv_buf) - 1);
+        ssize_t n = suspenders_hose_read(&conn, recv_buf, sizeof(recv_buf) - 1);
         if (n <= 0) {
             fprintf(stderr, "Client %d: Read failed\n", client_id);
             break;
@@ -152,7 +154,7 @@ void client_worker(void *arg) {
     
     printf("Client %d: Received %d/%d PONGs\n", client_id, pongs_received, NUM_PINGS);
 
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
 
     /* Signal shutdown when all clients are done */
     if (__atomic_add_fetch(&clients_done, 1, __ATOMIC_RELAXED) == NUM_CLIENTS) {

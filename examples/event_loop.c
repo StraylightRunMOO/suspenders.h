@@ -15,61 +15,61 @@ static void on_tick(void *arg) {
 }
 
 static void echo_client(void *arg) {
-    hose_t *client = (hose_t*)arg;
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char buf[256];
     ssize_t n;
-    while ((n = hose_read(client, buf, sizeof(buf))) > 0) {
-        hose_write(client, buf, (size_t)n);
+    while ((n = suspenders_hose_read(client, buf, sizeof(buf))) > 0) {
+        suspenders_hose_write(client, buf, (size_t)n);
     }
-    hose_close(client);
+    suspenders_hose_close(client);
     memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
 }
 
 static void server(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", EVENT_LOOP_PORT);
-    if (!hose_listen(&listener, uri)) {
+    if (!suspenders_hose_listen(&listener, uri)) {
         fprintf(stderr, "[event_loop] listen failed\n");
         return;
     }
     printf("[event_loop] echo server listening on %d\n", EVENT_LOOP_PORT);
 
     while (ticks < 8) {
-        hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(*client));
+        suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(*client));
         if (!client) continue;
-        if (hose_accept(&listener, client)) {
+        if (suspenders_hose_accept(&listener, client)) {
             suspenders_spawn(echo_client, client, SUSPENDERS_QOS_NORMAL);
         } else {
             memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
         }
     }
-    hose_close(&listener);
+    suspenders_hose_close(&listener);
 }
 
 static void client(void *arg) {
     (void)arg;
-    hose_t conn;
-    hose_init(&conn, NULL);
+    suspenders_hose_t conn;
+    suspenders_hose_init(&conn, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", EVENT_LOOP_PORT);
-    if (!hose_dial(&conn, uri)) {
+    if (!suspenders_hose_dial(&conn, uri)) {
         fprintf(stderr, "[event_loop] dial failed\n");
         return;
     }
 
     const char *msg = "hello event loop";
-    if (hose_write(&conn, msg, strlen(msg)) > 0) {
+    if (suspenders_hose_write(&conn, msg, strlen(msg)) > 0) {
         char buf[64] = {0};
-        ssize_t n = hose_read(&conn, buf, sizeof(buf) - 1);
+        ssize_t n = suspenders_hose_read(&conn, buf, sizeof(buf) - 1);
         if (n > 0)
             printf("[event_loop] client received: %.*s\n", (int)n, buf);
     }
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
 }
 
 static void coordinator(void *arg) {

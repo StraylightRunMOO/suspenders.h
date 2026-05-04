@@ -5,7 +5,9 @@
  *       -I../include -I../third_party $(pkg-config --cflags --libs liburing) -lpthread
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,11 +37,11 @@ void signal_handler(int sig) {
 
 void unix_client(void *arg) {
     int id = (int)(intptr_t)arg;
-    hose_t conn;
+    suspenders_hose_t conn;
     struct buf b = {0};
-    hose_init(&conn, &b);
+    suspenders_hose_init(&conn, &b);
 
-    if (!hose_dial(&conn, "unix://" SOCKET_PATH)) {
+    if (!suspenders_hose_dial(&conn, "unix://" SOCKET_PATH)) {
         fprintf(stderr, "Client %d: Failed to connect\n", id);
         return;
     }
@@ -50,9 +52,9 @@ void unix_client(void *arg) {
 
     for (int i = 0; i < MESSAGES_PER_CLIENT && running; i++) {
         snprintf(send_buf, sizeof(send_buf), "Hello %d:%d", id, i);
-        if (hose_write(&conn, send_buf, strlen(send_buf)) <= 0) break;
+        if (suspenders_hose_write(&conn, send_buf, strlen(send_buf)) <= 0) break;
 
-        ssize_t n = hose_read(&conn, recv_buf, sizeof(recv_buf) - 1);
+        ssize_t n = suspenders_hose_read(&conn, recv_buf, sizeof(recv_buf) - 1);
         if (n <= 0) break;
         recv_buf[n] = '\0';
 
@@ -63,7 +65,7 @@ void unix_client(void *arg) {
     }
 
     printf("Client %d: %d/%d echoed\n", id, ok, MESSAGES_PER_CLIENT);
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
 
     if (__atomic_add_fetch(&clients_done, 1, __ATOMIC_RELAXED) == NUM_CLIENTS) {
         running = 0;
@@ -72,28 +74,28 @@ void unix_client(void *arg) {
 }
 
 void unix_handler(void *arg) {
-    hose_t *client = (hose_t*)arg;
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char buf[256];
 
     while (running) {
-        ssize_t n = hose_read(client, buf, sizeof(buf));
+        ssize_t n = suspenders_hose_read(client, buf, sizeof(buf));
         if (n <= 0) break;
-        if (hose_write(client, buf, n) <= 0) break;
+        if (suspenders_hose_write(client, buf, n) <= 0) break;
     }
 
-    hose_close(client);
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
 }
 
 void unix_listener(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
 
     /* Remove stale socket file */
     unlink(SOCKET_PATH);
 
-    if (!hose_listen(&listener, "unix://" SOCKET_PATH)) {
+    if (!suspenders_hose_listen(&listener, "unix://" SOCKET_PATH)) {
         fprintf(stderr, "[Server] Failed to listen\n");
         return;
     }
@@ -101,11 +103,11 @@ void unix_listener(void *arg) {
     printf("[Server] Listening on %s\n", SOCKET_PATH);
 
     while (running) {
-        hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+        suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
         if (!client) continue;
 
-        if (!hose_accept(&listener, client)) {
-            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+        if (!suspenders_hose_accept(&listener, client)) {
+            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
             if (!running) break;
             continue;
         }
@@ -113,7 +115,7 @@ void unix_listener(void *arg) {
         suspenders_spawn(unix_handler, client, SUSPENDERS_QOS_NORMAL);
     }
 
-    hose_close(&listener);
+    suspenders_hose_close(&listener);
     unlink(SOCKET_PATH);
 }
 

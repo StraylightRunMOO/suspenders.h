@@ -132,12 +132,12 @@ Channels provide rendezvous-style communication between coroutines. The sender a
 ### Async I/O (Hoses)
 
 ```c
-void hose_init(hose_t *d, struct io_uring *ring, struct buf *b);
-bool hose_dial(hose_t *d, const char *uri);      // tcp://host:port
-bool hose_listen(hose_t *d, const char *uri);    // tcp://0.0.0.0:port
-bool hose_read(hose_t *d, void *dest, size_t len);
-bool hose_write(hose_t *d, const void *src, size_t len);
-void hose_close(hose_t *d);
+void suspenders_hose_init(suspenders_hose_t *d, struct io_uring *ring, struct buf *b);
+bool suspenders_hose_dial(suspenders_hose_t *d, const char *uri);      // tcp://host:port
+bool suspenders_hose_listen(suspenders_hose_t *d, const char *uri);    // tcp://0.0.0.0:port
+bool suspenders_hose_read(suspenders_hose_t *d, void *dest, size_t len);
+bool suspenders_hose_write(suspenders_hose_t *d, const void *src, size_t len);
+void suspenders_hose_close(suspenders_hose_t *d);
 ```
 
 Hose operations automatically suspend the calling coroutine until the I/O completes, allowing other coroutines to run.
@@ -227,29 +227,29 @@ int main(void) {
 
 ```c
 void handle_client(void *arg) {
-    hose_t *client = (hose_t*)arg;
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char buffer[1024];
     
-    while (hose_read(client, buffer, sizeof(buffer))) {
-        hose_write(client, buffer, strlen(buffer));
+    while (suspenders_hose_read(client, buffer, sizeof(buffer))) {
+        suspenders_hose_write(client, buffer, strlen(buffer));
     }
     
-    hose_close(client);
+    suspenders_hose_close(client);
 }
 
 void server(void *arg) {
-    hose_t listener, client;
+    suspenders_hose_t listener, client;
     struct buf b;
     
     buf_clear(&b);
-    hose_init(&listener, suspenders_ring(), &b);
+    suspenders_hose_init(&listener, suspenders_ring(), &b);
     
-    if (!hose_listen(&listener, "tcp://0.0.0.0:8080")) {
+    if (!suspenders_hose_listen(&listener, "tcp://0.0.0.0:8080")) {
         fprintf(stderr, "Failed to bind\n");
         return;
     }
     
-    while (hose_accept(&listener, &client)) {
+    while (suspenders_hose_accept(&listener, &client)) {
         suspenders_spawn(handle_client, &client, SUSPENDERS_QOS_NORMAL);
     }
 }

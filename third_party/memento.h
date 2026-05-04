@@ -1,3 +1,42 @@
+/*
+ * Memento Memory Allocator Library
+ * 
+ * A high-performance, multi-allocator memory management library.
+ * Non-locking design - no atomics, no locks, completely thread-local.
+ * 
+ * Features:
+ * - Thread Heap: Purely thread-local caching (no atomics!)
+ * - Pool: Fixed-size object pools
+ * - Arena: Bump allocator with power-of-2 growth
+ * - Stack: LIFO scope-based allocator  
+ * - Slab: Multi-size object caching
+ * 
+ * Usage (C):
+ *   #define MEMENTO_IMPLEMENTATION
+ *   #include "memento.h"
+ *   
+ *   int main() {
+ *       memento_init();
+ *       memento_thread_heap_t* heap = memento_thread_heap_get();
+ *       void* ptr = memento_thread_heap_alloc(heap, 1024);
+ *       memento_thread_heap_free(heap, ptr, 1024);
+ *       return 0;
+ *   }
+ * 
+ * Usage (C++):
+ *   #include "memento.hpp"
+ *   
+ *   int main() {
+ *       memento::context ctx;
+ *       memento::heap h;
+ *       auto obj = h.construct<MyClass>(args...);
+ *       h.destroy(obj);
+ *       return 0;
+ *   }
+ * 
+ * License: MIT
+ */
+
 #ifndef MEMENTO_H
 #define MEMENTO_H
 
@@ -36,18 +75,18 @@ extern "C" {
     #define MEMENTO_PLATFORM_POSIX 0
     #if defined(_MSC_VER)
         #define MEMENTO_TLS __declspec(thread)
-        #define MEMENTO_FORCE_INLINE __forceinline
+        #define MEMENTO_FORCE_INLINE static __forceinline
         #define MEMENTO_NOINLINE __declspec(noinline)
     #else
         #define MEMENTO_TLS __thread
-        #define MEMENTO_FORCE_INLINE inline __attribute__((always_inline))
+        #define MEMENTO_FORCE_INLINE static inline __attribute__((always_inline))
         #define MEMENTO_NOINLINE __attribute__((noinline))
     #endif
 #else
     #define MEMENTO_PLATFORM_WINDOWS 0
     #define MEMENTO_PLATFORM_POSIX 1
     #define MEMENTO_TLS __thread
-    #define MEMENTO_FORCE_INLINE inline __attribute__((always_inline))
+    #define MEMENTO_FORCE_INLINE static inline __attribute__((always_inline))
     #define MEMENTO_NOINLINE __attribute__((noinline))
 #endif
 
@@ -208,14 +247,8 @@ void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
  * Utility API
  * ============================================================================ */
 
-/* Get size class for a given allocation size */
-size_t memento_size_class_for(size_t size);
-size_t memento_size_class_to_size(size_t sc);
-
-/* Alignment utilities */
-bool memento_is_power_of_two(size_t x);
-size_t memento_align_up(size_t size, size_t alignment);
-size_t memento_align_down(size_t size, size_t alignment);
+/* Size class and alignment utilities are static inline functions defined in
+ * the MEMENTO_IMPLEMENTATION block (internal helpers, not public API). */
 
 #ifdef __cplusplus
 }
@@ -230,6 +263,23 @@ size_t memento_align_down(size_t size, size_t alignment);
  * ============================================================================ */
 
 #ifdef MEMENTO_IMPLEMENTATION
+
+/* The implementation is C11 code. When compiled as C++ (single-TU
+ * convenience), silence pedantic warnings about C idioms such as designated
+ * initializers, {0} aggregate init, and flexible array members. */
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wc99-extensions"
+    #pragma clang diagnostic ignored "-Wc++20-designator"
+    #pragma clang diagnostic ignored "-Wmissing-field-initializers"
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+  #endif
+#endif
+
 
 /* ============================================================================
  * Internal Implementation - Non-locking Design
@@ -391,7 +441,7 @@ memento_thread_heap_t* memento_thread_heap_get(void) {
  * Cache Operations - Non-locking
  * ============================================================================ */
 
-static MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* cache) {
+MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* cache) {
     memento_cache_node_t* node = cache->head;
     if (MEMENTO_LIKELY(node != NULL)) {
         cache->head = node->next;
@@ -401,7 +451,7 @@ static MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* 
     return NULL;
 }
 
-static MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* cache, void* ptr) {
+MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* cache, void* ptr) {
     if (cache->count >= cache->limit) {
         return false; /* Cache full */
     }
@@ -943,6 +993,15 @@ void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size) {
         memento_thread_heap_free(slab->heap, ptr, slab->classes[sc].block_size);
     }
 }
+
+
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic pop
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic pop
+  #endif
+#endif
 
 #endif /* MEMENTO_IMPLEMENTATION */
 

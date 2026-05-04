@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,23 +12,7 @@
 #define SUSPENDERS_IMPLEMENTATION
 #include "suspenders.h"
 
-/* Test framework */
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define RUN_TEST(test_func) do { \
-    printf("  Running %-40s ", #test_func "..."); \
-    fflush(stdout); \
-    tests_run++; \
-    if (test_func() == 0) { \
-        printf("PASSED\n"); \
-        tests_passed++; \
-    } else { \
-        printf("FAILED\n"); \
-        tests_failed++; \
-    } \
-} while(0)
+#include "suspenders_test.h"
 
 static volatile int test_counter = 0;
 static volatile int count1 = 0, count2 = 0, count3 = 0;
@@ -43,7 +29,7 @@ void test_basic_cr(void *arg) {
 
 static int test_basic_spawn(void) {
     test_counter = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(test_basic_cr, (void*)&test_counter, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
@@ -63,7 +49,7 @@ void counter_cr(void *arg) {
 
 static int test_multiple_coroutines(void) {
     count1 = 0; count2 = 0; count3 = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(counter_cr, (void*)&count1, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(counter_cr, (void*)&count2, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(counter_cr, (void*)&count3, SUSPENDERS_QOS_NORMAL);
@@ -95,7 +81,7 @@ void yield_b(void *arg) {
 static int test_yield(void) {
     yield_idx = 0;
     memset((void*)yield_order, 0, sizeof(yield_order));
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(yield_a, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(yield_b, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
@@ -135,7 +121,7 @@ void suspend_controller(void *arg) {
 static int test_suspend_resume(void) {
     suspend_count = 0;
     worker_cr = NULL;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(suspend_controller, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
@@ -169,14 +155,18 @@ void ch_receiver(void *arg) {
 
 static int test_channel_basic(void) {
     ch_sent = 0; ch_recv = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     test_ch = suspenders_chan_create(sizeof(int), 0);
     if (!test_ch) return 1;
     suspenders_spawn(ch_receiver, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(ch_sender, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
     suspenders_shutdown();
-    return (ch_sent == 10 && ch_recv == 10) ? 0 : 1;
+    ASSERT_EQ_INT(10, ch_sent);
+    ASSERT_EQ_INT(10, ch_recv);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -206,7 +196,7 @@ void ch_consumer(void *arg) {
 
 static int test_channel_rendezvous(void) {
     ch_total_sent = 0; ch_total_recv = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     test_ch = suspenders_chan_create(sizeof(int), 0);
     if (!test_ch) return 1;
     suspenders_spawn(ch_consumer, NULL, SUSPENDERS_QOS_NORMAL);
@@ -214,8 +204,12 @@ static int test_channel_rendezvous(void) {
     suspenders_spawn(ch_producer, (void*)1000, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(ch_producer, (void*)2000, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
     suspenders_shutdown();
-    return (ch_total_sent == 150 && ch_total_recv == 150) ? 0 : 1;
+    ASSERT_EQ_INT(150, ch_total_sent);
+    ASSERT_EQ_INT(150, ch_total_recv);
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -244,83 +238,83 @@ static int test_buffer_ops(void) {
 /* -------------------------------------------------------------------------- */
 #define TEST_PORT 54321
 
-static volatile int hose_test_pass = 0;
-static volatile int hose_server_ready = 0;
+static volatile int suspenders_hose_test_pass = 0;
+static volatile int suspenders_hose_server_ready = 0;
 
-void hose_server_cr(void *arg) {
+void suspenders_hose_server_cr(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", TEST_PORT);
-    if (!hose_listen(&listener, uri)) {
+    if (!suspenders_hose_listen(&listener, uri)) {
         fprintf(stderr, "[hose test] listen failed\n");
         return;
     }
 
-    hose_server_ready = 1;
+    suspenders_hose_server_ready = 1;
 
-    hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
-    if (!client) { hose_close(&listener); return; }
+    suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
+    if (!client) { suspenders_hose_close(&listener); return; }
 
-    if (!hose_accept(&listener, client)) {
-        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
-        hose_close(&listener);
+    if (!suspenders_hose_accept(&listener, client)) {
+        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
+        suspenders_hose_close(&listener);
         return;
     }
 
     char buf[64];
-    ssize_t n = hose_read(client, buf, sizeof(buf));
+    ssize_t n = suspenders_hose_read(client, buf, sizeof(buf));
     if (n > 0) {
-        hose_write(client, buf, n);  /* Echo back */
+        suspenders_hose_write(client, buf, n);  /* Echo back */
     }
 
-    hose_close(client);
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
-    hose_close(&listener);
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
+    suspenders_hose_close(&listener);
 }
 
-void hose_client_cr(void *arg) {
+void suspenders_hose_client_cr(void *arg) {
     (void)arg;
     /* Wait for server to be listening */
-    for (int i = 0; i < 100 && !hose_server_ready; i++)
+    for (int i = 0; i < 100 && !suspenders_hose_server_ready; i++)
         suspenders_yield();
 
-    hose_t conn;
+    suspenders_hose_t conn;
     struct buf b = {0};
-    hose_init(&conn, &b);
+    suspenders_hose_init(&conn, &b);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", TEST_PORT);
-    if (!hose_dial(&conn, uri)) {
+    if (!suspenders_hose_dial(&conn, uri)) {
         fprintf(stderr, "[hose test] dial failed\n");
         return;
     }
 
     const char *msg = "HELLO HOSE";
-    if (hose_write(&conn, msg, strlen(msg)) <= 0) {
-        hose_close(&conn);
+    if (suspenders_hose_write(&conn, msg, strlen(msg)) <= 0) {
+        suspenders_hose_close(&conn);
         return;
     }
 
     char rbuf[64] = {0};
-    ssize_t n = hose_read(&conn, rbuf, sizeof(rbuf) - 1);
+    ssize_t n = suspenders_hose_read(&conn, rbuf, sizeof(rbuf) - 1);
     if (n > 0 && strncmp(rbuf, msg, n) == 0)
-        hose_test_pass = 1;
+        suspenders_hose_test_pass = 1;
 
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
 }
 
 static int test_hose_tcp(void) {
-    hose_test_pass = 0;
-    hose_server_ready = 0;
-    suspenders_init(0, 256);
-    suspenders_spawn(hose_server_cr, NULL, SUSPENDERS_QOS_HIGH);
-    suspenders_spawn(hose_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_hose_test_pass = 0;
+    suspenders_hose_server_ready = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(suspenders_hose_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(suspenders_hose_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
-    return hose_test_pass ? 0 : 1;
+    return suspenders_hose_test_pass ? 0 : 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -347,7 +341,7 @@ void qos_high(void *arg) {
 static int test_qos_ordering(void) {
     qos_idx = 0;
     memset((void*)qos_order, 0, sizeof(qos_order));
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     /* Spawn in reverse priority order */
     suspenders_spawn(qos_low, NULL, SUSPENDERS_QOS_LOW);
     suspenders_spawn(qos_normal, NULL, SUSPENDERS_QOS_NORMAL);
@@ -381,7 +375,7 @@ void cancel_trigger(void *arg) {
 static int test_cancel(void) {
     cancel_resumed = 0;
     cancel_done = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     cancel_target_cr = suspenders_spawn(cancel_target, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_spawn(cancel_trigger, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
@@ -415,7 +409,7 @@ void boost_controller(void *arg) {
 
 static int test_boost(void) {
     boost_step = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(boost_controller, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
@@ -428,7 +422,7 @@ static int test_boost(void) {
 static int test_reentrant_init(void) {
     for (int i = 0; i < 3; i++) {
         test_counter = 0;
-        suspenders_init(0, 256);
+        suspenders_init(st_workers(), 256);
         suspenders_spawn(test_basic_cr, (void*)&test_counter, SUSPENDERS_QOS_NORMAL);
         suspenders_run();
         suspenders_shutdown();
@@ -452,7 +446,7 @@ void chain_worker(void *arg) {
 
 static int test_spawn_chain(void) {
     chain_depth = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(chain_worker, (void*)0, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
@@ -466,18 +460,18 @@ static volatile int dial_failed = 0;
 
 void dial_failure_cr(void *arg) {
     (void)arg;
-    hose_t conn;
+    suspenders_hose_t conn;
     struct buf b = {0};
-    hose_init(&conn, &b);
-    if (!hose_dial(&conn, "tcp://127.0.0.1:1")) {
+    suspenders_hose_init(&conn, &b);
+    if (!suspenders_hose_dial(&conn, "tcp://127.0.0.1:1")) {
         dial_failed = 1;
     }
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
 }
 
 static int test_hose_dial_failure(void) {
     dial_failed = 0;
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(dial_failure_cr, NULL, SUSPENDERS_QOS_NORMAL);
     suspenders_run();
     suspenders_shutdown();
@@ -491,28 +485,28 @@ static int test_hose_dial_failure(void) {
 
 static volatile int cross_owner_server_ready = 0;
 static volatile int cross_owner_hose_ready = 0;
-static hose_t *volatile cross_owner_conn = NULL;
+static suspenders_hose_t *volatile cross_owner_conn = NULL;
 static volatile int cross_owner_pass = 0;
 
 void cross_owner_user(void *arg);
 
 void cross_owner_server(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CROSS_OWNER_PORT);
-    if (!hose_listen(&listener, uri)) return;
+    if (!suspenders_hose_listen(&listener, uri)) return;
 
     cross_owner_server_ready = 1;
 
-    hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
-    if (!client) { hose_close(&listener); return; }
+    suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
+    if (!client) { suspenders_hose_close(&listener); return; }
 
-    if (!hose_accept(&listener, client)) {
-        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
-        hose_close(&listener);
+    if (!suspenders_hose_accept(&listener, client)) {
+        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
+        suspenders_hose_close(&listener);
         return;
     }
 
@@ -520,14 +514,14 @@ void cross_owner_server(void *arg) {
     suspenders_yield();
 
     char buf[64];
-    ssize_t n = hose_read(client, buf, sizeof(buf));
+    ssize_t n = suspenders_hose_read(client, buf, sizeof(buf));
     if (n > 0) {
-        hose_write(client, buf, n);
+        suspenders_hose_write(client, buf, n);
     }
 
-    hose_close(client);
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
-    hose_close(&listener);
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
+    suspenders_hose_close(&listener);
 }
 
 void cross_owner_creator(void *arg) {
@@ -536,14 +530,14 @@ void cross_owner_creator(void *arg) {
     while (!cross_owner_server_ready)
         suspenders_yield();
 
-    hose_t *conn = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+    suspenders_hose_t *conn = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
     if (!conn) return;
-    hose_init(conn, NULL);
+    suspenders_hose_init(conn, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CROSS_OWNER_PORT);
-    if (!hose_dial(conn, uri)) {
-        memento_thread_heap_free(memento_thread_heap_get(), conn, sizeof(hose_t));
+    if (!suspenders_hose_dial(conn, uri)) {
+        memento_thread_heap_free(memento_thread_heap_get(), conn, sizeof(suspenders_hose_t));
         return;
     }
 
@@ -560,18 +554,18 @@ void cross_owner_user(void *arg) {
     if (!cross_owner_conn) return;
 
     const char *msg = "CROSS OWNER";
-    if (hose_write(cross_owner_conn, msg, strlen(msg)) <= 0) {
-        hose_close(cross_owner_conn);
+    if (suspenders_hose_write(cross_owner_conn, msg, strlen(msg)) <= 0) {
+        suspenders_hose_close(cross_owner_conn);
         return;
     }
 
     char rbuf[64] = {0};
-    ssize_t n = hose_read(cross_owner_conn, rbuf, sizeof(rbuf) - 1);
+    ssize_t n = suspenders_hose_read(cross_owner_conn, rbuf, sizeof(rbuf) - 1);
     if (n > 0 && strncmp(rbuf, msg, n) == 0)
         cross_owner_pass = 1;
 
-    hose_close(cross_owner_conn);
-    memento_thread_heap_free(memento_thread_heap_get(), cross_owner_conn, sizeof(hose_t));
+    suspenders_hose_close(cross_owner_conn);
+    memento_thread_heap_free(memento_thread_heap_get(), cross_owner_conn, sizeof(suspenders_hose_t));
 }
 
 static int test_hose_cross_owner(void) {
@@ -580,7 +574,7 @@ static int test_hose_cross_owner(void) {
     cross_owner_hose_ready = 0;
     cross_owner_conn = NULL;
 
-    suspenders_init(0, 256);
+    suspenders_init(st_workers(), 256);
     suspenders_spawn(cross_owner_server, NULL, SUSPENDERS_QOS_HIGH);
     suspenders_spawn(cross_owner_creator, NULL, SUSPENDERS_QOS_NORMAL);
     /* user is spawned by creator once the hose is ready */
@@ -592,30 +586,25 @@ static int test_hose_cross_owner(void) {
 /* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
-int main(void) {
+static const st_test_t st_tests[] = {
+    ST_TEST(test_basic_spawn),
+    ST_TEST(test_multiple_coroutines),
+    ST_TEST(test_yield),
+    ST_TEST(test_suspend_resume),
+    ST_TEST(test_channel_basic),
+    ST_TEST(test_channel_rendezvous),
+    ST_TEST(test_buffer_ops),
+    ST_TEST(test_hose_tcp),
+    ST_TEST(test_qos_ordering),
+    ST_TEST(test_cancel),
+    ST_TEST(test_boost),
+    ST_TEST(test_reentrant_init),
+    ST_TEST(test_spawn_chain),
+    ST_TEST(test_hose_dial_failure),
+    ST_TEST(test_hose_cross_owner),
+};
+
+int main(int argc, char **argv) {
     printf("\n=== Suspenders Test Suite ===\n\n");
-
-    RUN_TEST(test_basic_spawn);
-    RUN_TEST(test_multiple_coroutines);
-    RUN_TEST(test_yield);
-    RUN_TEST(test_suspend_resume);
-    RUN_TEST(test_channel_basic);
-    RUN_TEST(test_channel_rendezvous);
-    RUN_TEST(test_buffer_ops);
-    RUN_TEST(test_hose_tcp);
-    RUN_TEST(test_qos_ordering);
-    RUN_TEST(test_cancel);
-    RUN_TEST(test_boost);
-    RUN_TEST(test_reentrant_init);
-    RUN_TEST(test_spawn_chain);
-    RUN_TEST(test_hose_dial_failure);
-    RUN_TEST(test_hose_cross_owner);
-
-    printf("\n=== Test Summary ===\n");
-    printf("  Tests run:    %d\n", tests_run);
-    printf("  Tests passed: %d\n", tests_passed);
-    printf("  Tests failed: %d\n", tests_failed);
-    printf("\n");
-
-    return tests_failed > 0 ? 1 : 0;
+    return st_main(argc, argv, st_tests, sizeof(st_tests) / sizeof(st_tests[0]));
 }

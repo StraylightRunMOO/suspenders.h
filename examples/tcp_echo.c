@@ -11,7 +11,9 @@
  *   echo "Hello" | nc localhost 12345
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +40,7 @@ void signal_handler(int sig) {
 
 /* Echo handler - one per client connection */
 void echo_handler(void *arg) {
-    hose_t *client = (hose_t*)arg;
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char buffer[BUFFER_SIZE];
     
     int conn_num = __atomic_fetch_add(&total_connections, 1, __ATOMIC_RELAXED);
@@ -49,7 +51,7 @@ void echo_handler(void *arg) {
     
     while (running) {
         /* Async read via backend */
-        ssize_t bytes_read = hose_read(client, buffer, sizeof(buffer) - 1);
+        ssize_t bytes_read = suspenders_hose_read(client, buffer, sizeof(buffer) - 1);
         
         if (bytes_read <= 0) {
             break;
@@ -60,14 +62,14 @@ void echo_handler(void *arg) {
                buffer[bytes_read-1] == '\n' ? buffer : strcat(buffer, "\n"));
         
         /* Echo back */
-        if (hose_write(client, buffer, bytes_read) <= 0) {
+        if (suspenders_hose_write(client, buffer, bytes_read) <= 0) {
             break;
         }
     }
     
     printf("[Conn %d] Disconnected\n", conn_num);
-    hose_close(client);
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
     
     __atomic_fetch_sub(&active_connections, 1, __ATOMIC_RELAXED);
 }
@@ -75,15 +77,15 @@ void echo_handler(void *arg) {
 /* Server listener */
 void server_listener(void *arg) {
     (void)arg;
-    hose_t listener;
+    suspenders_hose_t listener;
     struct buf b = {0};
 
-    hose_init(&listener, &b);
+    suspenders_hose_init(&listener, &b);
     
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://0.0.0.0:%d", SERVER_PORT);
     
-    if (!hose_listen(&listener, uri)) {
+    if (!suspenders_hose_listen(&listener, uri)) {
         fprintf(stderr, "[Server] Failed to listen on %s\n", uri);
         return;
     }
@@ -92,11 +94,11 @@ void server_listener(void *arg) {
     printf("[Server] Test with: echo 'Hello' | nc -q 1 localhost %d\n\n", SERVER_PORT);
     
     while (running) {
-        hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+        suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
         if (!client) continue;
 
-        if (!hose_accept(&listener, client)) {
-            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+        if (!suspenders_hose_accept(&listener, client)) {
+            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
             continue;
         }
         
@@ -105,7 +107,7 @@ void server_listener(void *arg) {
     }
     
     printf("[Server] Shutting down\n");
-    hose_close(&listener);
+    suspenders_hose_close(&listener);
 }
 
 int main(void) {
