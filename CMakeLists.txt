@@ -107,6 +107,9 @@ enable_testing()
 add_suspenders_executable(suspenders-tests tests/test_main.c)
 add_test(NAME suspenders_unit_tests COMMAND suspenders-tests)
 
+add_suspenders_executable(test-memento tests/test_memento.c)
+add_test(NAME memento_unit_tests COMMAND test-memento)
+
 # Benchmarks
 add_suspenders_executable(suspenders-benchmark benchmarks/benchmark_suspenders.c)
 target_link_libraries(suspenders-benchmark PRIVATE ${MATH_LIBRARY})
