@@ -139,7 +139,7 @@ void ch_sender(void *arg) {
     (void)arg;
     for (int i = 0; i < 10; i++) {
         int val = i * 10;
-        if (suspenders_chan_send(test_ch, &val))
+        if (suspenders_chan_send(test_ch, &val) == SUSPENDERS_OK)
             ch_sent++;
     }
 }
@@ -148,7 +148,7 @@ void ch_receiver(void *arg) {
     (void)arg;
     for (int i = 0; i < 10; i++) {
         int val = -1;
-        if (suspenders_chan_recv(test_ch, &val) && val == i * 10)
+        if (suspenders_chan_recv(test_ch, &val) == SUSPENDERS_OK && val == i * 10)
             ch_recv++;
     }
 }
@@ -179,7 +179,7 @@ void ch_producer(void *arg) {
     int base = (int)(intptr_t)arg;
     for (int i = 0; i < 50; i++) {
         int val = base + i;
-        if (suspenders_chan_send(test_ch, &val))
+        if (suspenders_chan_send(test_ch, &val) == SUSPENDERS_OK)
             __atomic_fetch_add(&ch_total_sent, 1, __ATOMIC_RELAXED);
     }
 }
@@ -189,7 +189,7 @@ void ch_consumer(void *arg) {
     int expected = 3 * 50;
     for (int i = 0; i < expected; i++) {
         int val = 0;
-        if (suspenders_chan_recv(test_ch, &val))
+        if (suspenders_chan_recv(test_ch, &val) == SUSPENDERS_OK)
             __atomic_fetch_add(&ch_total_recv, 1, __ATOMIC_RELAXED);
     }
 }
@@ -995,7 +995,7 @@ static suspenders_cr_t *blocked_receiver_cr = NULL;
 void blocked_receiver(void *arg) {
     (void)arg;
     int val = 0;
-    chan_cancel_result = suspenders_chan_recv(test_ch, &val) ? 1 : 0;
+    chan_cancel_result = suspenders_chan_recv(test_ch, &val);
 }
 
 void chan_canceler(void *arg) {
@@ -1015,8 +1015,321 @@ static int test_channel_cancel(void) {
     suspenders_chan_destroy(test_ch);
     test_ch = NULL;
     suspenders_shutdown();
-    ASSERT_EQ_INT(0, chan_cancel_result);   /* recv failed with cancel */
-    ASSERT_EQ_INT(SUSPENDERS_CANCELED, suspenders_errno);
+    ASSERT_EQ_INT(SUSPENDERS_CANCELED, chan_cancel_result);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 26: Buffered channel - FIFO ordering, non-blocking until full        */
+/* -------------------------------------------------------------------------- */
+static volatile int buf_order_ok = 1;
+static volatile int buf_recv_count = 0;
+static volatile int buf_send_blocked_at = -1;
+
+void buf_producer(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 8; i++) {
+        /* Capacity is 4: sends 0..3 complete without a receiver; send 4
+         * must block until the consumer starts draining. */
+        if (i == 4) buf_send_blocked_at = buf_recv_count;
+        if (suspenders_chan_send(test_ch, &i) != SUSPENDERS_OK) buf_order_ok = 0;
+    }
+}
+
+void buf_consumer(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 8; i++) {
+        int val = -1;
+        if (suspenders_chan_recv(test_ch, &val) != SUSPENDERS_OK || val != i)
+            buf_order_ok = 0;
+        buf_recv_count++;
+    }
+}
+
+static int test_channel_buffered(void) {
+    buf_order_ok = 1;
+    buf_recv_count = 0;
+    buf_send_blocked_at = -1;
+    suspenders_init(st_workers(), 256);
+    test_ch = suspenders_chan_create(sizeof(int), 4);
+    ASSERT_NOT_NULL(test_ch);
+    /* Producer first: it fills the buffer before the consumer ever runs. */
+    suspenders_spawn(buf_producer, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(buf_consumer, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
+    suspenders_shutdown();
+    ASSERT_EQ_INT(1, buf_order_ok);
+    ASSERT_EQ_INT(8, buf_recv_count);
+    ASSERT_EQ_INT(0, buf_send_blocked_at);  /* buffer filled before any recv */
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 27: try_send / try_recv - FULL and EMPTY without blocking            */
+/* -------------------------------------------------------------------------- */
+static int test_channel_try_ops(void) {
+    suspenders_init(st_workers(), 256);
+    suspenders_chan_t *ch = suspenders_chan_create(sizeof(int), 2);
+    ASSERT_NOT_NULL(ch);
+    int v = 7, out = 0;
+
+    /* try ops work from the main thread (no coroutine needed) */
+    ASSERT_EQ_INT(SUSPENDERS_EMPTY, suspenders_chan_try_recv(ch, &out));
+    ASSERT_EQ_INT(SUSPENDERS_OK, suspenders_chan_try_send(ch, &v));
+    v = 8;
+    ASSERT_EQ_INT(SUSPENDERS_OK, suspenders_chan_try_send(ch, &v));
+    v = 9;
+    ASSERT_EQ_INT(SUSPENDERS_FULL, suspenders_chan_try_send(ch, &v));
+    ASSERT_EQ_INT(SUSPENDERS_OK, suspenders_chan_try_recv(ch, &out));
+    ASSERT_EQ_INT(7, out);
+    ASSERT_EQ_INT(SUSPENDERS_OK, suspenders_chan_try_recv(ch, &out));
+    ASSERT_EQ_INT(8, out);
+    ASSERT_EQ_INT(SUSPENDERS_EMPTY, suspenders_chan_try_recv(ch, &out));
+
+    /* rendezvous channel: try ops fail without a waiting peer */
+    suspenders_chan_t *rz = suspenders_chan_create(sizeof(int), 0);
+    ASSERT_NOT_NULL(rz);
+    ASSERT_EQ_INT(SUSPENDERS_FULL, suspenders_chan_try_send(rz, &v));
+    ASSERT_EQ_INT(SUSPENDERS_EMPTY, suspenders_chan_try_recv(rz, &out));
+
+    suspenders_chan_destroy(ch);
+    suspenders_chan_destroy(rz);
+    suspenders_shutdown();
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 28: close - drain semantics, blocked waiters fail, send-on-closed    */
+/* -------------------------------------------------------------------------- */
+static volatile int close_drained = 0;
+static volatile int close_recv_status = 12345;
+static volatile int close_blocked_recv_status = 12345;
+static volatile int close_send_status = 12345;
+
+void close_blocked_receiver(void *arg) {
+    (void)arg;
+    int v = 0;
+    close_blocked_recv_status = suspenders_chan_recv(test_ch, &v);
+}
+
+void close_driver(void *arg) {
+    suspenders_chan_t *buffered = (suspenders_chan_t*)arg;
+    /* Fill the buffered channel, close it, then drain past the end. */
+    for (int i = 0; i < 3; i++) suspenders_chan_send(buffered, &i);
+    suspenders_chan_close(buffered);
+    int v = -1;
+    while (suspenders_chan_recv(buffered, &v) == SUSPENDERS_OK) close_drained++;
+    close_recv_status = suspenders_errno;
+    close_send_status = suspenders_chan_send(buffered, &v);
+
+    /* Close the rendezvous channel out from under a blocked receiver. */
+    suspenders_yield();   /* let close_blocked_receiver park */
+    suspenders_chan_close(test_ch);
+}
+
+static int test_channel_close(void) {
+    close_drained = 0;
+    close_recv_status = close_blocked_recv_status = close_send_status = 12345;
+    suspenders_init(st_workers(), 256);
+    suspenders_chan_t *buffered = suspenders_chan_create(sizeof(int), 4);
+    test_ch = suspenders_chan_create(sizeof(int), 0);
+    ASSERT_NOT_NULL(buffered);
+    ASSERT_NOT_NULL(test_ch);
+    suspenders_spawn(close_blocked_receiver, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(close_driver, buffered, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_chan_destroy(buffered);
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
+    suspenders_shutdown();
+    ASSERT_EQ_INT(3, close_drained);                        /* buffer drained after close */
+    ASSERT_EQ_INT(SUSPENDERS_CLOSED, close_recv_status);    /* then CLOSED */
+    ASSERT_EQ_INT(SUSPENDERS_CLOSED, close_send_status);    /* send on closed */
+    ASSERT_EQ_INT(SUSPENDERS_CLOSED, close_blocked_recv_status);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 29: select - readiness, statistical fairness, blocking wake          */
+/* -------------------------------------------------------------------------- */
+static suspenders_chan_t *sel_a, *sel_b;
+static volatile int sel_pick_a = 0, sel_pick_b = 0;
+static volatile int sel_block_idx = -2;
+static volatile int sel_block_val = 0;
+
+void select_fairness_cr(void *arg) {
+    (void)arg;
+    /* Both channels always ready: distribution should hit both. */
+    for (int i = 0; i < 200; i++) {
+        int out = 0;
+        suspenders_chan_op_t ops[2] = {
+            { sel_a, &out, false },
+            { sel_b, &out, false },
+        };
+        int idx = suspenders_select(ops, 2);
+        if (idx == 0) { sel_pick_a++; suspenders_chan_send(sel_a, &out); }
+        else if (idx == 1) { sel_pick_b++; suspenders_chan_send(sel_b, &out); }
+    }
+}
+
+void select_blocker_cr(void *arg) {
+    (void)arg;
+    int out_a = 0, out_b = 0;
+    suspenders_chan_op_t ops[2] = {
+        { sel_a, &out_a, false },
+        { sel_b, &out_b, false },
+    };
+    sel_block_idx = suspenders_select(ops, 2);    /* nothing ready: parks */
+    sel_block_val = (sel_block_idx == 1) ? out_b : out_a;
+}
+
+void select_waker_cr(void *arg) {
+    (void)arg;
+    suspenders_yield();  /* let the blocker park on both channels */
+    int v = 42;
+    suspenders_chan_send(sel_b, &v);
+}
+
+static int test_select(void) {
+    sel_pick_a = sel_pick_b = 0;
+    sel_block_idx = -2;
+    sel_block_val = 0;
+    suspenders_init(st_workers(), 256);
+
+    /* Fairness: both buffered channels pre-loaded and refilled each pick. */
+    sel_a = suspenders_chan_create(sizeof(int), 1);
+    sel_b = suspenders_chan_create(sizeof(int), 1);
+    ASSERT_NOT_NULL(sel_a);
+    ASSERT_NOT_NULL(sel_b);
+    int seed_val = 1;
+    suspenders_chan_try_send(sel_a, &seed_val);
+    suspenders_chan_try_send(sel_b, &seed_val);
+    suspenders_spawn(select_fairness_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    ASSERT_EQ_INT(200, sel_pick_a + sel_pick_b);
+    ASSERT_TRUE(sel_pick_a >= 40 && sel_pick_b >= 40);   /* both sides chosen */
+
+    /* Drain the leftovers so the blocking select actually parks. */
+    int drain;
+    while (suspenders_chan_try_recv(sel_a, &drain) == SUSPENDERS_OK) {}
+    while (suspenders_chan_try_recv(sel_b, &drain) == SUSPENDERS_OK) {}
+
+    /* Blocking select woken by a send on the second channel. */
+    suspenders_spawn(select_blocker_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(select_waker_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    ASSERT_EQ_INT(1, sel_block_idx);
+    ASSERT_EQ_INT(42, sel_block_val);
+
+    suspenders_chan_destroy(sel_a);
+    suspenders_chan_destroy(sel_b);
+    suspenders_shutdown();
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 30: select - deadline, cancel, and close delivery                    */
+/* -------------------------------------------------------------------------- */
+static volatile int sel_dl_status = 12345;
+static volatile int sel_cancel_status = 12345;
+static volatile int sel_close_idx = -2;
+static volatile int sel_close_errno = 12345;
+static suspenders_cr_t *sel_cancel_cr = NULL;
+
+void select_deadline_cr(void *arg) {
+    (void)arg;
+    int out = 0;
+    suspenders_chan_op_t ops[1] = { { sel_a, &out, false } };
+    sel_dl_status = suspenders_select_dl(ops, 1, suspenders_now_ns() + 5 * 1000000ULL);
+}
+
+void select_cancel_victim(void *arg) {
+    (void)arg;
+    int out = 0;
+    suspenders_chan_op_t ops[2] = {
+        { sel_a, &out, false },
+        { sel_b, &out, false },
+    };
+    sel_cancel_status = suspenders_select(ops, 2);
+}
+
+void select_canceler(void *arg) {
+    (void)arg;
+    suspenders_yield();
+    suspenders_cancel(sel_cancel_cr);
+}
+
+void select_close_cr(void *arg) {
+    (void)arg;
+    int out = 0;
+    suspenders_chan_op_t ops[2] = {
+        { sel_a, &out, false },
+        { sel_b, &out, false },
+    };
+    sel_close_idx = suspenders_select(ops, 2);
+    sel_close_errno = suspenders_errno;
+}
+
+void select_closer(void *arg) {
+    (void)arg;
+    suspenders_yield();
+    suspenders_chan_close(sel_b);
+}
+
+static int test_select_edge_cases(void) {
+    sel_dl_status = sel_cancel_status = sel_close_errno = 12345;
+    sel_close_idx = -2;
+    suspenders_init(st_workers(), 256);
+    sel_a = suspenders_chan_create(sizeof(int), 0);
+    sel_b = suspenders_chan_create(sizeof(int), 0);
+    ASSERT_NOT_NULL(sel_a);
+    ASSERT_NOT_NULL(sel_b);
+
+    suspenders_spawn(select_deadline_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    sel_cancel_cr = suspenders_spawn(select_cancel_victim, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(select_canceler, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, sel_dl_status);
+    ASSERT_EQ_INT(SUSPENDERS_CANCELED, sel_cancel_status);
+
+    /* Close wakes a parked select with the closed case's index. */
+    suspenders_spawn(select_close_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(select_closer, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    ASSERT_EQ_INT(1, sel_close_idx);
+    ASSERT_EQ_INT(SUSPENDERS_CLOSED, sel_close_errno);
+
+    suspenders_chan_destroy(sel_a);
+    suspenders_chan_destroy(sel_b);
+    suspenders_shutdown();
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 31: chan recv with deadline times out                                */
+/* -------------------------------------------------------------------------- */
+static volatile int chan_dl_status = 12345;
+
+void chan_dl_cr(void *arg) {
+    (void)arg;
+    int out = 0;
+    chan_dl_status = suspenders_chan_recv_dl(test_ch, &out,
+                                             suspenders_now_ns() + 5 * 1000000ULL);
+}
+
+static int test_channel_deadline(void) {
+    chan_dl_status = 12345;
+    suspenders_init(st_workers(), 256);
+    test_ch = suspenders_chan_create(sizeof(int), 0);
+    ASSERT_NOT_NULL(test_ch);
+    suspenders_spawn(chan_dl_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
+    suspenders_shutdown();
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, chan_dl_status);
     return 0;
 }
 
@@ -1049,6 +1362,12 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_cond_var),
     ST_TEST(test_waitgroup),
     ST_TEST(test_channel_cancel),
+    ST_TEST(test_channel_buffered),
+    ST_TEST(test_channel_try_ops),
+    ST_TEST(test_channel_close),
+    ST_TEST(test_select),
+    ST_TEST(test_select_edge_cases),
+    ST_TEST(test_channel_deadline),
 };
 
 int main(int argc, char **argv) {

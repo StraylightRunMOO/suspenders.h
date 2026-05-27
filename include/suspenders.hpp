@@ -274,12 +274,12 @@ public:
     
     [[nodiscard]] bool send(const T& value) {
         if (!ch_) return false;
-        return suspenders_chan_send(ch_, const_cast<T*>(&value));
+        return suspenders_chan_send(ch_, const_cast<T*>(&value)) == SUSPENDERS_OK;
     }
     
     [[nodiscard]] bool recv(T& out) {
         if (!ch_) return false;
-        return suspenders_chan_recv(ch_, &out);
+        return suspenders_chan_recv(ch_, &out) == SUSPENDERS_OK;
     }
     
     // Blocking recv with optional

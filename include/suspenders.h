@@ -301,6 +301,8 @@ typedef struct suspenders_wq_node_s {
     int         status;
     struct suspenders_wq_list_s     *wait_list;
     struct suspenders_ticket_lock_s *wait_lock;
+    void       *select_rec;   /* non-NULL for suspenders_select stack nodes */
+    int         select_idx;
 } suspenders_wq_node_t;
 
 /* FIFO wait queue */
@@ -386,15 +388,32 @@ static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l) {
     suspenders_atomic_store(l->now_serving, current + 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
 }
 
-/* Channel - zero-copy rendezvous communication (FIFO waiters) */
+/* Channel - buffered ring + zero-copy rendezvous fast path (FIFO waiters).
+ * Invariants under lock: receivers parked => buffer empty;
+ * senders parked => buffer full (or rendezvous). */
 typedef struct {
     SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) size_t elem_sz;
-    size_t buf_sz;
-    suspenders_atomic_size_t count;
+    size_t buf_sz;                 /* capacity in elements (0 = rendezvous) */
+    suspenders_atomic_size_t count;/* buffered elements */
+    size_t head;                   /* ring read index */
+    char  *buf;                    /* ring storage (allocated with the chan) */
+    bool   closed;
     suspenders_wq_list_t senders;
     suspenders_wq_list_t receivers;
+    void  *alloc_base;             /* raw allocation (chan is 64-aligned inside) */
+    size_t alloc_size;
+    memento_thread_heap_t *owner_heap;
     suspenders_ticket_lock_t lock;
 } suspenders_chan_t;
+
+/* One case of a suspenders_select: send val to ch, or receive into val. */
+typedef struct {
+    suspenders_chan_t *ch;
+    void *val;
+    bool  is_send;
+} suspenders_chan_op_t;
+
+#define SUSPENDERS_SELECT_MAX 64
 
 /* Coroutine mutex - FIFO handoff with single-level priority inheritance.
  * Value type: zero-init or suspenders_mutex_init before use. */
@@ -608,10 +627,28 @@ void suspenders_pool_destroy(suspenders_pool_t *pool);
 void suspenders_pool_submit(suspenders_pool_t *pool,
                             void (*fn)(void*), void *arg);
 
+/* Channels. Blocking ops return SUSPENDERS_OK or an error code
+ * (CLOSED / CANCELED / TIMEDOUT / PERM outside a coroutine). try ops
+ * return FULL / EMPTY instead of blocking. close follows Go semantics:
+ * receivers drain the buffer, then get SUSPENDERS_CLOSED; senders fail
+ * immediately. */
 suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz);
+suspenders_chan_t* suspenders_chan_make(size_t elem_sz, size_t buf_sz);
 void suspenders_chan_destroy(suspenders_chan_t *ch);
-bool suspenders_chan_send(suspenders_chan_t *ch, void *val);
-bool suspenders_chan_recv(suspenders_chan_t *ch, void *out);
+int  suspenders_chan_send(suspenders_chan_t *ch, void *val);
+int  suspenders_chan_send_dl(suspenders_chan_t *ch, void *val, uint64_t deadline_ns);
+int  suspenders_chan_try_send(suspenders_chan_t *ch, void *val);
+int  suspenders_chan_recv(suspenders_chan_t *ch, void *out);
+int  suspenders_chan_recv_dl(suspenders_chan_t *ch, void *out, uint64_t deadline_ns);
+int  suspenders_chan_try_recv(suspenders_chan_t *ch, void *out);
+int  suspenders_chan_close(suspenders_chan_t *ch);
+
+/* Wait on up to SUSPENDERS_SELECT_MAX channel cases with randomized
+ * fairness. Returns the ready case's index (suspenders_errno is
+ * SUSPENDERS_OK, or SUSPENDERS_CLOSED if that case's channel closed), or
+ * a negative error (TIMEDOUT / CANCELED / INVAL / PERM). */
+int suspenders_select(suspenders_chan_op_t *ops, int n);
+int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns);
 
 /* Hose API - transport agnostic */
 void  suspenders_hose_init(suspenders_hose_t *d, struct buf *b);
@@ -1162,6 +1199,7 @@ static void s_wait_park(suspenders_wq_list_t *list, suspenders_ticket_lock_t *lo
     node->status = S_WQ_WAITING;
     node->wait_list = list;
     node->wait_lock = lock;
+    node->select_rec = NULL;
     s_wq_push(list, node);
 }
 
@@ -1469,73 +1507,374 @@ suspenders_cr_t* suspenders_go(void (*func)(void*), void *arg) {
 }
 
 /* ============================================================================
- * CHANNEL - Zero-copy rendezvous
+ * CHANNEL - buffered ring + zero-copy rendezvous, close, try ops, select
  * ============================================================================ */
+
+/* Select record shared by one suspenders_select call's stack nodes. */
+typedef struct {
+    suspenders_atomic_int winner;   /* case index, -1 until decided */
+} s_select_rec_t;
+
+/* Pop the next usable waiter from a channel wait list (caller holds the
+ * channel lock). Select nodes must win their select's winner CAS; losers
+ * (their select was already decided by another channel) are discarded. */
+static suspenders_wq_node_t* s_chan_take_waiter(suspenders_wq_list_t *list) {
+    suspenders_wq_node_t *n;
+    while ((n = s_wq_pop(list)) != NULL) {
+        if (!n->select_rec) return n;
+        s_select_rec_t *rec = (s_select_rec_t*)n->select_rec;
+        int expect = -1;
+        if (suspenders_atomic_compare_exchange_strong(rec->winner, expect, n->select_idx,
+                                                      SUSPENDERS_MEMORY_ORDER_ACQ_REL,
+                                                      SUSPENDERS_MEMORY_ORDER_ACQUIRE)) {
+            return n;
+        }
+        n->wait_list = NULL;   /* loser */
+    }
+    return NULL;
+}
+
+static inline void s_chan_buf_push(suspenders_chan_t *ch, const void *val) {
+    size_t count = suspenders_atomic_load(ch->count, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    size_t idx = (ch->head + count) % ch->buf_sz;
+    memcpy(ch->buf + idx * ch->elem_sz, val, ch->elem_sz);
+    suspenders_atomic_store(ch->count, count + 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
+}
+
+static inline void s_chan_buf_pop(suspenders_chan_t *ch, void *out) {
+    size_t count = suspenders_atomic_load(ch->count, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    memcpy(out, ch->buf + ch->head * ch->elem_sz, ch->elem_sz);
+    ch->head = (ch->head + 1) % ch->buf_sz;
+    suspenders_atomic_store(ch->count, count - 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
+}
+
 suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz) {
-    suspenders_chan_t *ch = (suspenders_chan_t*)memento_thread_heap_alloc(memento_thread_heap_get(),
-                                                  sizeof(suspenders_chan_t));
-    if (SUSPENDERS_UNLIKELY(!ch)) return NULL;
+    if (SUSPENDERS_UNLIKELY(elem_sz == 0)) {
+        suspenders_errno = SUSPENDERS_INVAL;
+        return NULL;
+    }
+    /* Over-allocate so the 64-byte-aligned chan (and its ring, right after
+     * it) fit regardless of the heap's natural 16-byte alignment. */
+    memento_thread_heap_t *heap = memento_thread_heap_get();
+    size_t total = sizeof(suspenders_chan_t) + SUSPENDERS_CACHELINE + elem_sz * buf_sz;
+    void *base = memento_thread_heap_alloc(heap, total);
+    if (SUSPENDERS_UNLIKELY(!base)) {
+        suspenders_errno = SUSPENDERS_NOMEM;
+        return NULL;
+    }
+    uintptr_t aligned = ((uintptr_t)base + SUSPENDERS_CACHELINE - 1) &
+                        ~((uintptr_t)SUSPENDERS_CACHELINE - 1);
+    suspenders_chan_t *ch = (suspenders_chan_t*)aligned;
     memset(ch, 0, sizeof(*ch));
     ch->elem_sz = elem_sz;
     ch->buf_sz = buf_sz;
+    ch->buf = buf_sz ? (char*)(ch + 1) : NULL;
+    ch->alloc_base = base;
+    ch->alloc_size = total;
+    ch->owner_heap = heap;
     suspenders_ticket_init(&ch->lock);
     return ch;
 }
 
-bool suspenders_chan_send(suspenders_chan_t *ch, void *val) {
-    if (SUSPENDERS_UNLIKELY(!ch || !val)) return false;
+suspenders_chan_t* suspenders_chan_make(size_t elem_sz, size_t buf_sz) {
+    return suspenders_chan_create(elem_sz, buf_sz);
+}
 
+void suspenders_chan_destroy(suspenders_chan_t *ch) {
+    if (!ch) return;
+    memento_thread_heap_free(ch->owner_heap, ch->alloc_base, ch->alloc_size);
+}
+
+static int s_chan_send_impl(suspenders_chan_t *ch, void *val,
+                            uint64_t deadline_ns, bool try_only) {
+    if (SUSPENDERS_UNLIKELY(!ch || !val)) {
+        suspenders_errno = SUSPENDERS_INVAL;
+        return SUSPENDERS_INVAL;
+    }
     suspenders_cr_t *cr = suspenders_running;
-    bool can_block = (cr && cr != suspenders_main_cr);
-    if (can_block && SUSPENDERS_UNLIKELY(s_pre_block(cr) != 0)) return false;
+    bool can_block = !try_only && cr && cr != suspenders_main_cr;
+    if (can_block) {
+        int pre = s_pre_block(cr);
+        if (SUSPENDERS_UNLIKELY(pre != 0)) return pre;
+    }
 
     suspenders_ticket_lock(&ch->lock);
 
-    if (ch->receivers.head) {
-        suspenders_wq_node_t *rx = s_wq_pop(&ch->receivers);
+    if (SUSPENDERS_UNLIKELY(ch->closed)) {
+        suspenders_ticket_unlock(&ch->lock);
+        suspenders_errno = SUSPENDERS_CLOSED;
+        return SUSPENDERS_CLOSED;
+    }
+
+    suspenders_wq_node_t *rx = s_chan_take_waiter(&ch->receivers);
+    if (rx) {
         memcpy(rx->data_ptr, val, ch->elem_sz);
         s_wait_grant(rx, SUSPENDERS_OK);
         suspenders_ticket_unlock(&ch->lock);
         suspenders_resume(rx->cr);
-        return true;
+        return SUSPENDERS_OK;
     }
 
-    if (ch->buf_sz == 0 && can_block) {
-        s_wait_park(&ch->senders, &ch->lock, val);
+    if (ch->buf_sz &&
+        suspenders_atomic_load(ch->count, SUSPENDERS_MEMORY_ORDER_RELAXED) < ch->buf_sz) {
+        s_chan_buf_push(ch, val);
         suspenders_ticket_unlock(&ch->lock);
-        return s_wait_block() == SUSPENDERS_OK;
+        return SUSPENDERS_OK;
     }
 
+    if (!can_block) {
+        suspenders_ticket_unlock(&ch->lock);
+        int st = try_only ? SUSPENDERS_FULL : SUSPENDERS_PERM;
+        suspenders_errno = st;
+        return st;
+    }
+
+    s_wait_park(&ch->senders, &ch->lock, val);
     suspenders_ticket_unlock(&ch->lock);
-    return false;
+    return s_wait_block_dl(deadline_ns);
 }
 
-bool suspenders_chan_recv(suspenders_chan_t *ch, void *out) {
-    if (SUSPENDERS_UNLIKELY(!ch || !out)) return false;
-
+static int s_chan_recv_impl(suspenders_chan_t *ch, void *out,
+                            uint64_t deadline_ns, bool try_only) {
+    if (SUSPENDERS_UNLIKELY(!ch || !out)) {
+        suspenders_errno = SUSPENDERS_INVAL;
+        return SUSPENDERS_INVAL;
+    }
     suspenders_cr_t *cr = suspenders_running;
-    bool can_block = (cr && cr != suspenders_main_cr);
-    if (can_block && SUSPENDERS_UNLIKELY(s_pre_block(cr) != 0)) return false;
+    bool can_block = !try_only && cr && cr != suspenders_main_cr;
+    if (can_block) {
+        int pre = s_pre_block(cr);
+        if (SUSPENDERS_UNLIKELY(pre != 0)) return pre;
+    }
 
     suspenders_ticket_lock(&ch->lock);
 
-    if (ch->senders.head) {
-        suspenders_wq_node_t *tx = s_wq_pop(&ch->senders);
+    if (ch->buf_sz &&
+        suspenders_atomic_load(ch->count, SUSPENDERS_MEMORY_ORDER_RELAXED) > 0) {
+        s_chan_buf_pop(ch, out);
+        /* A parked sender can now deposit into the freed slot (FIFO). */
+        suspenders_wq_node_t *tx = s_chan_take_waiter(&ch->senders);
+        if (tx) {
+            s_chan_buf_push(ch, tx->data_ptr);
+            s_wait_grant(tx, SUSPENDERS_OK);
+            suspenders_ticket_unlock(&ch->lock);
+            suspenders_resume(tx->cr);
+        } else {
+            suspenders_ticket_unlock(&ch->lock);
+        }
+        return SUSPENDERS_OK;
+    }
+
+    suspenders_wq_node_t *tx = s_chan_take_waiter(&ch->senders);
+    if (tx) {
         memcpy(out, tx->data_ptr, ch->elem_sz);
         s_wait_grant(tx, SUSPENDERS_OK);
         suspenders_ticket_unlock(&ch->lock);
         suspenders_resume(tx->cr);
-        return true;
+        return SUSPENDERS_OK;
     }
 
-    if (ch->buf_sz == 0 && can_block) {
-        s_wait_park(&ch->receivers, &ch->lock, out);
+    if (SUSPENDERS_UNLIKELY(ch->closed)) {
         suspenders_ticket_unlock(&ch->lock);
-        return s_wait_block() == SUSPENDERS_OK;
+        suspenders_errno = SUSPENDERS_CLOSED;
+        return SUSPENDERS_CLOSED;
     }
 
+    if (!can_block) {
+        suspenders_ticket_unlock(&ch->lock);
+        int st = try_only ? SUSPENDERS_EMPTY : SUSPENDERS_PERM;
+        suspenders_errno = st;
+        return st;
+    }
+
+    s_wait_park(&ch->receivers, &ch->lock, out);
     suspenders_ticket_unlock(&ch->lock);
-    return false;
+    return s_wait_block_dl(deadline_ns);
+}
+
+int suspenders_chan_send(suspenders_chan_t *ch, void *val) {
+    return s_chan_send_impl(ch, val, 0, false);
+}
+
+int suspenders_chan_send_dl(suspenders_chan_t *ch, void *val, uint64_t deadline_ns) {
+    return s_chan_send_impl(ch, val, deadline_ns, false);
+}
+
+int suspenders_chan_try_send(suspenders_chan_t *ch, void *val) {
+    return s_chan_send_impl(ch, val, 0, true);
+}
+
+int suspenders_chan_recv(suspenders_chan_t *ch, void *out) {
+    return s_chan_recv_impl(ch, out, 0, false);
+}
+
+int suspenders_chan_recv_dl(suspenders_chan_t *ch, void *out, uint64_t deadline_ns) {
+    return s_chan_recv_impl(ch, out, deadline_ns, false);
+}
+
+int suspenders_chan_try_recv(suspenders_chan_t *ch, void *out) {
+    return s_chan_recv_impl(ch, out, 0, true);
+}
+
+int suspenders_chan_close(suspenders_chan_t *ch) {
+    if (SUSPENDERS_UNLIKELY(!ch)) {
+        suspenders_errno = SUSPENDERS_INVAL;
+        return SUSPENDERS_INVAL;
+    }
+    suspenders_ticket_lock(&ch->lock);
+    if (ch->closed) {
+        suspenders_ticket_unlock(&ch->lock);
+        suspenders_errno = SUSPENDERS_CLOSED;
+        return SUSPENDERS_CLOSED;
+    }
+    ch->closed = true;
+
+    /* Fail every parked waiter with CLOSED (buffered data stays drainable;
+     * receivers only park when the buffer is empty). */
+    suspenders_wq_node_t *wake = NULL, *wake_tail = NULL, *n;
+    suspenders_wq_list_t *lists[2] = { &ch->senders, &ch->receivers };
+    for (int i = 0; i < 2; i++) {
+        while ((n = s_chan_take_waiter(lists[i])) != NULL) {
+            s_wait_grant(n, SUSPENDERS_CLOSED);
+            if (wake_tail) wake_tail->next = n;
+            else wake = n;
+            wake_tail = n;
+        }
+    }
+    suspenders_ticket_unlock(&ch->lock);
+
+    while (wake) {
+        suspenders_wq_node_t *next = wake->next;
+        wake->next = NULL;
+        suspenders_resume(wake->cr);
+        wake = next;
+    }
+    return SUSPENDERS_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * SELECT - randomized-fairness multi-channel wait
+ * ------------------------------------------------------------------------- */
+static SUSPENDERS_TLS uint32_t s_select_seed = 0;
+
+static uint32_t s_rand32(void) {
+    uint32_t x = s_select_seed;
+    if (x == 0) x = (uint32_t)(suspenders_now_ns() | 1);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s_select_seed = x;
+    return x;
+}
+
+int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns) {
+    if (SUSPENDERS_UNLIKELY(!ops || n <= 0 || n > SUSPENDERS_SELECT_MAX)) {
+        suspenders_errno = SUSPENDERS_INVAL;
+        return SUSPENDERS_INVAL;
+    }
+    suspenders_cr_t *cr = suspenders_running;
+    bool can_block = cr && cr != suspenders_main_cr;
+    if (can_block) {
+        int pre = s_pre_block(cr);
+        if (SUSPENDERS_UNLIKELY(pre != 0)) return pre;
+    }
+
+    /* Randomized-start try scan: a ready (or closed) case wins outright. */
+    uint32_t r = s_rand32();
+    for (int i = 0; i < n; i++) {
+        int idx = (int)((r + (uint32_t)i) % (uint32_t)n);
+        suspenders_chan_op_t *op = &ops[idx];
+        int st = op->is_send ? suspenders_chan_try_send(op->ch, op->val)
+                             : suspenders_chan_try_recv(op->ch, op->val);
+        if (st == SUSPENDERS_OK || st == SUSPENDERS_CLOSED) {
+            suspenders_errno = st;
+            return idx;
+        }
+    }
+
+    if (!can_block) {
+        suspenders_errno = SUSPENDERS_PERM;
+        return SUSPENDERS_PERM;
+    }
+
+    /* Nothing ready: park a stack node on every channel. Cancellation and
+     * deadlines are delivered through cr->wq_node (no list). */
+    s_select_rec_t rec;
+    suspenders_atomic_init(rec.winner, -1);
+    suspenders_wq_node_t nodes[SUSPENDERS_SELECT_MAX];
+
+    suspenders_wq_node_t *cnode = &cr->wq_node;
+    cnode->cr = cr;
+    cnode->status = S_WQ_WAITING;
+    cnode->wait_list = NULL;
+    cnode->wait_lock = NULL;
+    cnode->select_rec = NULL;
+
+    for (int i = 0; i < n; i++) {
+        suspenders_wq_node_t *node = &nodes[i];
+        node->cr = cr;
+        node->data_ptr = ops[i].val;
+        node->status = S_WQ_WAITING;
+        node->select_rec = &rec;
+        node->select_idx = i;
+        suspenders_chan_t *ch = ops[i].ch;
+        suspenders_ticket_lock(&ch->lock);
+        suspenders_wq_list_t *list = ops[i].is_send ? &ch->senders : &ch->receivers;
+        node->wait_list = list;
+        node->wait_lock = &ch->lock;
+        s_wq_push(list, node);
+        suspenders_ticket_unlock(&ch->lock);
+    }
+
+    suspenders_timer_t t;
+    bool armed = false;
+    if (deadline_ns) {
+        memset(&t, 0, sizeof(t));
+        t.deadline_ns = deadline_ns;
+        t.cb = s_wait_deadline_cb;
+        t.arg = cr;
+        armed = s_timer_arm(&t);
+    }
+
+    while (suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE) == -1 &&
+           cnode->status == S_WQ_WAITING) {
+        suspenders_suspend();
+    }
+    if (armed) s_timer_disarm(&t);
+
+    /* Unregister any node still parked (under each channel's lock). */
+    for (int i = 0; i < n; i++) {
+        suspenders_chan_t *ch = ops[i].ch;
+        suspenders_ticket_lock(&ch->lock);
+        if (nodes[i].wait_list) {
+            s_wq_remove(nodes[i].wait_list, &nodes[i]);
+            nodes[i].wait_list = NULL;
+        }
+        suspenders_ticket_unlock(&ch->lock);
+    }
+
+    int widx = suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE);
+    int st = cnode->status;
+    cnode->status = SUSPENDERS_OK;   /* never leave a stale WAITING marker */
+
+    if (widx >= 0) {
+        /* The winning channel completed the op (or closed under us). */
+        suspenders_errno = nodes[widx].status == SUSPENDERS_CLOSED ? SUSPENDERS_CLOSED
+                                                                   : SUSPENDERS_OK;
+        return widx;
+    }
+
+    if (st == SUSPENDERS_CANCELED) {
+        suspenders_atomic_store(cr->cancel_requested, 0, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    } else if (st == S_WQ_WAITING) {
+        st = SUSPENDERS_ERROR;   /* stray wake with no decision; report */
+    }
+    suspenders_errno = st;
+    return st;
+}
+
+int suspenders_select(suspenders_chan_op_t *ops, int n) {
+    return suspenders_select_dl(ops, n, 0);
 }
 
 
@@ -3116,11 +3455,6 @@ typedef struct {
     void *arg;
 } suspenders_task_t;
 
-void suspenders_chan_destroy(suspenders_chan_t *ch) {
-    if (!ch) return;
-    memento_thread_heap_free(memento_thread_heap_get(), ch, sizeof(*ch));
-}
-
 /* -------------------------------------------------------------------------- */
 /* Dispatch queue (serial task queue)                                         */
 /* -------------------------------------------------------------------------- */
@@ -3136,7 +3470,7 @@ static void suspenders_dispatch_worker(void *arg) {
     while (!q->shutdown) {
         suspenders_task_t task;
         memset(&task, 0, sizeof(task));
-        if (!suspenders_chan_recv(q->chan, &task)) continue;
+        if (suspenders_chan_recv(q->chan, &task) != SUSPENDERS_OK) continue;
         if (!task.fn) break; /* sentinel */
         task.fn(task.arg);
     }
@@ -3202,7 +3536,7 @@ static void suspenders_pool_worker(void *arg) {
     while (!pool->shutdown) {
         suspenders_task_t task;
         memset(&task, 0, sizeof(task));
-        if (!suspenders_chan_recv(pool->chan, &task)) continue;
+        if (suspenders_chan_recv(pool->chan, &task) != SUSPENDERS_OK) continue;
         if (!task.fn) break; /* sentinel */
         task.fn(task.arg);
     }
