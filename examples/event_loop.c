@@ -8,6 +8,7 @@
 #define EVENT_LOOP_PORT 54321
 
 static int ticks = 0;
+static suspenders_timer_t *tick_timer = NULL;
 
 static void on_tick(void *arg) {
     (void)arg;
@@ -41,13 +42,21 @@ static void server(void *arg) {
     while (ticks < 8) {
         suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(*client));
         if (!client) continue;
-        if (suspenders_hose_accept(&listener, client)) {
+        /* Deadline-bounded accept so the loop re-checks the tick count. */
+        if (suspenders_hose_accept_dl(&listener, client,
+                                      suspenders_now_ns() + 250 * 1000000ULL)) {
             suspenders_spawn(echo_client, client, SUSPENDERS_QOS_NORMAL);
         } else {
             memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
         }
     }
     suspenders_hose_close(&listener);
+
+    /* Stop the periodic timer so the scheduler can wind down. */
+    if (tick_timer) {
+        suspenders_timer_cancel(tick_timer);
+        tick_timer = NULL;
+    }
 }
 
 static void client(void *arg) {
@@ -75,7 +84,7 @@ static void client(void *arg) {
 static void coordinator(void *arg) {
     (void)arg;
     /* A periodic timer keeps the loop alive and demonstrates timer integration. */
-    suspenders_timer_create(250, true, on_tick, NULL);
+    tick_timer = suspenders_timer_create(250, true, on_tick, NULL);
 
     suspenders_spawn(server, NULL, SUSPENDERS_QOS_HIGH);
 

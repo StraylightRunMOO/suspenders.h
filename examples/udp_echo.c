@@ -49,8 +49,11 @@ void udp_server(void *arg) {
     socklen_t addr_len = sizeof(client_addr);
 
     while (running && replies_ok < NUM_MESSAGES) {
-        ssize_t n = suspenders_hose_recvfrom(&server, buf, sizeof(buf) - 1,
-                                  (struct sockaddr*)&client_addr, &addr_len);
+        /* Deadline-bounded so the loop re-checks `running` when idle. */
+        addr_len = sizeof(client_addr);
+        ssize_t n = suspenders_hose_recvfrom_dl(&server, buf, sizeof(buf) - 1,
+                                  (struct sockaddr*)&client_addr, &addr_len,
+                                  suspenders_now_ns() + 250 * 1000000ULL);
         if (n < 0) {
             if (!running) break;
             continue;

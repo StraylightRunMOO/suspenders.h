@@ -361,7 +361,39 @@ public:
         }
         return false;
     }
-    
+
+    [[nodiscard]] bool accept_dl(Hose& client, uint64_t deadline_ns) {
+        if (!valid_) return false;
+        suspenders_hose_t client_hose;
+        if (suspenders_hose_accept_dl(&suspenders_hose_, &client_hose, deadline_ns)) {
+            client.close();
+            client.suspenders_hose_ = client_hose;
+            client.valid_ = true;
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] ssize_t read_dl(void* dest, size_t len, uint64_t deadline_ns) {
+        if (!valid_) return -1;
+        return suspenders_hose_read_dl(&suspenders_hose_, dest, len, deadline_ns);
+    }
+
+    [[nodiscard]] ssize_t write_dl(const void* src, size_t len, uint64_t deadline_ns) {
+        if (!valid_) return -1;
+        return suspenders_hose_write_dl(&suspenders_hose_, src, len, deadline_ns);
+    }
+
+    [[nodiscard]] ssize_t readv(const struct iovec* iov, int iovcnt) {
+        if (!valid_) return -1;
+        return suspenders_hose_readv(&suspenders_hose_, iov, iovcnt);
+    }
+
+    [[nodiscard]] ssize_t writev(const struct iovec* iov, int iovcnt) {
+        if (!valid_) return -1;
+        return suspenders_hose_writev(&suspenders_hose_, iov, iovcnt);
+    }
+
     // I/O operations
     [[nodiscard]] ssize_t read(void* dest, size_t len) {
         if (!valid_) return -1;
@@ -691,15 +723,5 @@ inline void sleep_for(std::chrono::duration<Rep, Period> duration) {
 inline uint64_t now_ns() {
     return suspenders_now_ns();
 }
-
-// ============================================================================
-// Async I/O Helpers
-// ============================================================================
-
-#if SUSPENDERS_BACKEND_IOURING
-inline void writev_async(int fd, struct iovec* iovs, int count) {
-    suspenders_writev_async(fd, iovs, count);
-}
-#endif
 
 } // namespace suspenders

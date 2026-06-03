@@ -1334,6 +1334,242 @@ static int test_channel_deadline(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test 32: hose readv/writev round-trip                                      */
+/* -------------------------------------------------------------------------- */
+#define IOVEC_TEST_PORT 54322
+
+static volatile int iovec_test_pass = 0;
+static volatile int iovec_server_ready = 0;
+
+void iovec_server_cr(void *arg) {
+    (void)arg;
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", IOVEC_TEST_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) return;
+    iovec_server_ready = 1;
+
+    suspenders_hose_t client;
+    if (!suspenders_hose_accept(&listener, &client)) {
+        suspenders_hose_close(&listener);
+        return;
+    }
+    char buf[64];
+    ssize_t n = suspenders_hose_read(&client, buf, sizeof(buf));
+    if (n > 0) suspenders_hose_write(&client, buf, (size_t)n);
+    suspenders_hose_close(&client);
+    suspenders_hose_close(&listener);
+}
+
+void iovec_client_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100 && !iovec_server_ready; i++) suspenders_yield();
+
+    suspenders_hose_t conn;
+    suspenders_hose_init(&conn, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", IOVEC_TEST_PORT);
+    if (!suspenders_hose_dial(&conn, uri)) return;
+
+    char part1[] = "hello, ";
+    char part2[] = "world";
+    struct iovec wv[2] = { { part1, 7 }, { part2, 5 } };
+    if (suspenders_hose_writev(&conn, wv, 2) != 12) {
+        suspenders_hose_close(&conn);
+        return;
+    }
+
+    char r1[7], r2[8];
+    struct iovec rv[2] = { { r1, sizeof(r1) }, { r2, sizeof(r2) } };
+    ssize_t n = suspenders_hose_readv(&conn, rv, 2);
+    if (n == 12 && memcmp(r1, "hello, ", 7) == 0 && memcmp(r2, "world", 5) == 0) {
+        iovec_test_pass = 1;
+    }
+    suspenders_hose_close(&conn);
+}
+
+static int test_hose_readv_writev(void) {
+    iovec_test_pass = 0;
+    iovec_server_ready = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(iovec_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(iovec_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(1, iovec_test_pass);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 33: hose read deadline fires (silent peer)                            */
+/* -------------------------------------------------------------------------- */
+#define RDDL_TEST_PORT 54323
+
+static volatile int rddl_test_pass = 0;
+static volatile int rddl_server_ready = 0;
+
+void rddl_server_cr(void *arg) {
+    (void)arg;
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", RDDL_TEST_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) return;
+    rddl_server_ready = 1;
+
+    suspenders_hose_t client;
+    if (!suspenders_hose_accept(&listener, &client)) {
+        suspenders_hose_close(&listener);
+        return;
+    }
+    /* Send nothing; hold the connection until the client hangs up. */
+    char buf[8];
+    (void)suspenders_hose_read(&client, buf, sizeof(buf));
+    suspenders_hose_close(&client);
+    suspenders_hose_close(&listener);
+}
+
+void rddl_client_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100 && !rddl_server_ready; i++) suspenders_yield();
+
+    suspenders_hose_t conn;
+    suspenders_hose_init(&conn, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", RDDL_TEST_PORT);
+    if (!suspenders_hose_dial(&conn, uri)) return;
+
+    uint64_t start = suspenders_now_ns();
+    char buf[8];
+    ssize_t n = suspenders_hose_read_dl(&conn, buf, sizeof(buf),
+                                        start + 30 * 1000000ULL);
+    int err = suspenders_errno;
+    uint64_t elapsed = suspenders_now_ns() - start;
+    if (n == -1 && err == SUSPENDERS_TIMEDOUT && elapsed >= 25 * 1000000ULL) {
+        rddl_test_pass = 1;
+    }
+    suspenders_hose_close(&conn);
+}
+
+static int test_hose_read_deadline(void) {
+    rddl_test_pass = 0;
+    rddl_server_ready = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(rddl_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(rddl_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(1, rddl_test_pass);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 34: hose accept deadline fires (no client)                            */
+/* -------------------------------------------------------------------------- */
+#define ACDL_TEST_PORT 54324
+
+static volatile int acdl_test_pass = 0;
+
+void acdl_server_cr(void *arg) {
+    (void)arg;
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", ACDL_TEST_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) return;
+
+    uint64_t start = suspenders_now_ns();
+    suspenders_hose_t client;
+    bool ok = suspenders_hose_accept_dl(&listener, &client,
+                                        start + 30 * 1000000ULL);
+    int err = suspenders_errno;
+    uint64_t elapsed = suspenders_now_ns() - start;
+    if (!ok && err == SUSPENDERS_TIMEDOUT && elapsed >= 25 * 1000000ULL) {
+        acdl_test_pass = 1;
+    }
+    suspenders_hose_close(&listener);
+}
+
+static int test_hose_accept_deadline(void) {
+    acdl_test_pass = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(acdl_server_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(1, acdl_test_pass);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 35: cancel a coroutine blocked in hose read                           */
+/* -------------------------------------------------------------------------- */
+#define CXL_TEST_PORT 54325
+
+static volatile int cxl_test_pass = 0;
+static volatile int cxl_server_ready = 0;
+static volatile int cxl_reading = 0;
+static suspenders_cr_t *volatile cxl_victim = NULL;
+
+void cxl_server_cr(void *arg) {
+    (void)arg;
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CXL_TEST_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) return;
+    cxl_server_ready = 1;
+
+    suspenders_hose_t client;
+    if (!suspenders_hose_accept(&listener, &client)) {
+        suspenders_hose_close(&listener);
+        return;
+    }
+    char buf[8];
+    (void)suspenders_hose_read(&client, buf, sizeof(buf));
+    suspenders_hose_close(&client);
+    suspenders_hose_close(&listener);
+}
+
+void cxl_victim_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 100 && !cxl_server_ready; i++) suspenders_yield();
+
+    suspenders_hose_t conn;
+    suspenders_hose_init(&conn, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CXL_TEST_PORT);
+    if (!suspenders_hose_dial(&conn, uri)) return;
+
+    cxl_reading = 1;
+    char buf[8];
+    ssize_t n = suspenders_hose_read(&conn, buf, sizeof(buf));
+    if (n == -1 && suspenders_errno == SUSPENDERS_CANCELED) cxl_test_pass = 1;
+    suspenders_hose_close(&conn);
+}
+
+void cxl_canceler_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 200 && !cxl_reading; i++) suspenders_yield();
+    suspenders_sleep_ns(10 * 1000000ULL);  /* let the victim park in the read */
+    suspenders_cancel(cxl_victim);
+}
+
+static int test_hose_cancel_read(void) {
+    cxl_test_pass = 0;
+    cxl_server_ready = 0;
+    cxl_reading = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(cxl_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    cxl_victim = suspenders_spawn(cxl_victim_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(cxl_canceler_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(1, cxl_test_pass);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 static const st_test_t st_tests[] = {
@@ -1368,6 +1604,10 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_select),
     ST_TEST(test_select_edge_cases),
     ST_TEST(test_channel_deadline),
+    ST_TEST(test_hose_readv_writev),
+    ST_TEST(test_hose_read_deadline),
+    ST_TEST(test_hose_accept_deadline),
+    ST_TEST(test_hose_cancel_read),
 };
 
 int main(int argc, char **argv) {
