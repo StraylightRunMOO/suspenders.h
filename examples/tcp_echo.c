@@ -45,10 +45,10 @@ void echo_handler(void *arg) {
     __atomic_fetch_add(&active_connections, 1, __ATOMIC_RELAXED);
     
     printf("[Conn %d fd=%d] Connected (active: %d)\n", 
-           conn_num, client->fd, active_connections);
+           conn_num, (int)client->fd, active_connections);
     
     while (running) {
-        /* Async read via io_uring */
+        /* Async read via backend */
         ssize_t bytes_read = hose_read(client, buffer, sizeof(buffer) - 1);
         
         if (bytes_read <= 0) {
@@ -78,7 +78,7 @@ void server_listener(void *arg) {
     hose_t listener;
     struct buf b = {0};
 
-    hose_init(&listener, suspenders_ring(), &b);
+    hose_init(&listener, &b);
     
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://0.0.0.0:%d", SERVER_PORT);
