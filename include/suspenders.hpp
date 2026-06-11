@@ -112,7 +112,8 @@ public:
     
     [[nodiscard]] State state() const {
         if (!cr_) return State::Done;
-        return static_cast<State>(cr_->state);
+        // suspenders_atomic_int is std::atomic<int> in C++ mode: load first
+        return static_cast<State>(static_cast<int>(cr_->state));
     }
     
     [[nodiscard]] bool done() const {
@@ -248,9 +249,7 @@ public:
     }
     
     ~Channel() {
-        if (ch_) {
-            memento_thread_heap_free(memento_thread_heap_get(), ch_, sizeof(suspenders_chan_t));
-        }
+        if (ch_) suspenders_chan_destroy(ch_);
     }
     
     // Non-copyable, movable
@@ -263,9 +262,7 @@ public:
     
     Channel& operator=(Channel&& other) noexcept {
         if (this != &other) {
-            if (ch_) {
-                memento_thread_heap_free(memento_thread_heap_get(), ch_, sizeof(suspenders_chan_t));
-            }
+            if (ch_) suspenders_chan_destroy(ch_);
             ch_ = other.ch_;
             other.ch_ = nullptr;
         }

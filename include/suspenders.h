@@ -305,7 +305,11 @@ typedef struct suspenders_wq_node_s {
     struct suspenders_cr_s *cr;
     void       *data_ptr;
     struct suspenders_wq_node_s *next;
-    int         status;
+    suspenders_atomic_int status;   /* atomic: deciders may run on another worker */
+    suspenders_atomic_int waker_busy; /* decider handshake: set before the status
+                                       * flip, cleared after the wake — the waiter
+                                       * must not recycle the node (or exit) while
+                                       * the decider may still touch node/cr */
     struct suspenders_wq_list_s     *wait_list;
     struct suspenders_ticket_lock_s *wait_lock;
     void       *select_rec;   /* non-NULL for suspenders_select stack nodes */
@@ -346,13 +350,13 @@ typedef struct suspenders_timer_s {
  * heap's natural alignment. */
 typedef struct suspenders_cr_s {
     SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_ctx_t ctx;
-    suspenders_state_t    state;
+    suspenders_atomic_int state;  /* suspenders_state_t; atomic: advisory cross-worker reads */
     suspenders_atomic_int effective_qos;
     int              base_qos;
     memento_arena_t *arena;       /* Stack arena (also holds this struct) */
     suspenders_wq_node_t  wq_node;
     int32_t          io_result;   /* Result from last I/O op */
-    struct suspenders_cr_s *next;      /* Ready queue linkage */
+    struct suspenders_cr_s *next;      /* Ready queue / injector linkage (owner thread) */
     /* Identity & introspection */
     uint64_t         id;
     char             name[32];
@@ -362,9 +366,22 @@ typedef struct suspenders_cr_s {
     suspenders_cleanup_t *cleanup_head;
     suspenders_timer_t    deadline_timer;   /* armed by suspenders_deadline */
     bool             deadline_armed;
-    /* Ownership (multi-worker scheduling lands in a later phase) */
+    /* Ownership: a coroutine pins to the worker that first runs it; all
+     * cross-worker wakes go through that worker's MPSC inbox. inbox_next is
+     * the inbox stack link — it must be distinct from `next`, which the
+     * owner's ready queue uses concurrently. wake_inflight dedups inbox
+     * pushes (a cr rides its single inbox_next); pending_wake is owner-only:
+     * a wake that arrived while the cr was not suspended is re-delivered
+     * when the cr next switches out instead of being dropped. */
     memento_thread_heap_t *owner_heap;
-    void            *worker;
+    suspenders_atomic_uintptr_t worker;   /* suspenders_worker_t*, written once at pin */
+    struct suspenders_cr_s *inbox_next;
+    suspenders_atomic_int wake_inflight;
+    int              pending_wake;
+    /* Owner-thread live list (s_live_crs): every pinned, unfinished cr is
+     * tracked so shutdown can reclaim coroutines still parked mid-flight. */
+    struct suspenders_cr_s *live_prev;
+    struct suspenders_cr_s *live_next;
     /* In-flight completion-mode I/O op (io_uring); cancel/deadline route
      * through IORING_OP_ASYNC_CANCEL so exactly one CQE wakes the cr. */
     void            *pending_io;
@@ -732,6 +749,13 @@ void  suspenders_hose_close(suspenders_hose_t *d);
     #include <liburing.h>
 #endif
 
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    #include <pthread.h>
+#endif
+#if SUSPENDERS_PLATFORM_LINUX
+    #include <sys/eventfd.h>
+#endif
+
 /* Thread-local detailed error */
 SUSPENDERS_TLS int suspenders_errno = SUSPENDERS_OK;
 
@@ -755,15 +779,18 @@ const char *suspenders_strerror(int err) {
 }
 
 /* Thread-local state. The main (scheduler) coroutine lives in static TLS
- * storage: naturally 64-byte aligned and immune to allocator lifetime. */
+ * storage: naturally 64-byte aligned and immune to allocator lifetime.
+ * Every worker thread (including the suspenders_run caller, worker 0) has
+ * its own copy of all of this: private ready queues, backend, timer heap. */
 static SUSPENDERS_TLS suspenders_cr_t *suspenders_running = NULL;
 static SUSPENDERS_TLS suspenders_cr_t suspenders_main_cr_storage;
 static SUSPENDERS_TLS suspenders_cr_t *suspenders_main_cr = NULL;
 static SUSPENDERS_TLS suspenders_cr_t *ready_queue_heads[SUSPENDERS_QOS_COUNT] = {0};
 static SUSPENDERS_TLS suspenders_cr_t *ready_queue_tails[SUSPENDERS_QOS_COUNT] = {0};
+static SUSPENDERS_TLS suspenders_cr_t *s_zombies = NULL;   /* crs are pinned: exit is local */
+static SUSPENDERS_TLS suspenders_cr_t *s_live_crs = NULL;  /* pinned, unfinished crs (owner thread) */
 static SUSPENDERS_TLS int suspenders_initialized = 0;
 static suspenders_atomic_int active_coroutines = 0;
-static suspenders_atomic_uintptr_t zombie_head = 0;
 static suspenders_atomic_uintptr_t suspenders_next_id = 1;
 
 /* wq_node.status while a waiter is parked; decided waits carry an error
@@ -782,12 +809,137 @@ static void s_iou_cancel(void *io_op);
 /* Backend instance */
 static SUSPENDERS_TLS struct suspenders_backend_s *suspenders_backend = NULL;
 
+/* ============================================================================
+ * WORKERS - one scheduler thread each. A coroutine pins to the worker that
+ * first runs it (taken from the global injector); after that, every
+ * cross-worker wake goes through the pinned worker's MPSC inbox (Treiber
+ * stack riding on cr->next, deduped by cr->wake_inflight) plus an eventfd
+ * kick when the worker is parked in its backend wait. The eventfd stays
+ * readable until drained, so a signal that races the park is never lost.
+ * ============================================================================ */
+typedef struct suspenders_worker_s {
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE)
+    suspenders_atomic_uintptr_t inbox;   /* MPSC stack of suspenders_cr_t* */
+    suspenders_atomic_int parked;        /* 1 while blocked in backend wait */
+    int  index;
+    suspenders_sock_t wake_rd;           /* eventfd (rd == wr) or pipe */
+    suspenders_sock_t wake_wr;
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    pthread_t thread;                    /* helper workers only */
+#endif
+    void *wake_op;                       /* io_uring: this worker's wake sentinel op */
+} suspenders_worker_t;
+
+static suspenders_worker_t *s_workers = NULL;
+static unsigned s_num_workers = 0;
+static unsigned s_queue_hint = 256;
+static suspenders_atomic_int s_stop = 0;
+static SUSPENDERS_TLS suspenders_worker_t *s_worker = NULL;  /* this thread's worker */
+
+/* Global injector: freshly spawned coroutines land here and are taken by
+ * whichever worker goes idle first (or by worker 0 in single-worker mode
+ * when spawned from a foreign thread). */
+static suspenders_ticket_lock_t s_injector_lock;
+static suspenders_cr_t *s_injector_heads[SUSPENDERS_QOS_COUNT];
+static suspenders_cr_t *s_injector_tails[SUSPENDERS_QOS_COUNT];
+static suspenders_atomic_int s_injector_count = 0;
+
+/* --- worker wake fd (eventfd on Linux, pipe elsewhere) ------------------- */
+static bool s_wake_fd_create(suspenders_worker_t *w) {
+#if SUSPENDERS_PLATFORM_LINUX
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) return false;
+    w->wake_rd = w->wake_wr = fd;
+    return true;
+#elif defined(SUSPENDERS_PLATFORM_WINDOWS)
+    /* Multi-worker is POSIX-only for now; single worker never signals. */
+    w->wake_rd = w->wake_wr = SUSPENDERS_INVALID_SOCK;
+    return true;
+#else
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    (void)fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    (void)fcntl(fds[1], F_SETFL, O_NONBLOCK);
+    w->wake_rd = fds[0];
+    w->wake_wr = fds[1];
+    return true;
+#endif
+}
+
+static void s_wake_fd_destroy(suspenders_worker_t *w) {
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    if (w->wake_rd >= 0) close(w->wake_rd);
+    if (w->wake_wr >= 0 && w->wake_wr != w->wake_rd) close(w->wake_wr);
+#endif
+    w->wake_rd = w->wake_wr = SUSPENDERS_INVALID_SOCK;
+}
+
+static void s_wake_drain(suspenders_worker_t *w) {
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    char buf[64];
+    while (read(w->wake_rd, buf, sizeof(buf)) > 0) { /* drain */ }
+#else
+    (void)w;
+#endif
+}
+
+/* Kick a worker if (and only if) it might be parked. The eventfd stays
+ * readable until drained, so signal-vs-park races cannot lose the wake. */
+static void s_worker_signal(suspenders_worker_t *w) {
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    if (w->wake_wr < 0) return;
+    if (suspenders_atomic_load(w->parked, SUSPENDERS_MEMORY_ORDER_SEQ_CST)) {
+#if SUSPENDERS_PLATFORM_LINUX
+        uint64_t one = 1;
+        ssize_t r = write(w->wake_wr, &one, sizeof(one));
+#else
+        char one = 1;
+        ssize_t r = write(w->wake_wr, &one, 1);
+#endif
+        (void)r;
+    }
+#else
+    (void)w;
+#endif
+}
+
+/* Cross-worker wake: push the cr onto its pinned worker's inbox. The
+ * wake_inflight flag dedups concurrent pushes (a cr can only ride its
+ * single inbox_next link once); the consumer clears it after popping. A
+ * skipped push is never lost: the pending entry either delivers, or the
+ * consumer records pending_wake and re-delivers at the cr's next park. */
+/* cr->worker is written once when the cr pins and read by foreign threads
+ * (resume/cancel routing) — seq_cst so it pairs with the cancel_requested
+ * handshake: a canceler that reads no pin stored the flag before the pin,
+ * so s_injector_take's flag check sees it (Dekker). */
+static inline suspenders_worker_t* s_cr_worker(suspenders_cr_t *cr) {
+    return (suspenders_worker_t*)suspenders_atomic_load(cr->worker,
+                                                        SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+}
+
+static void s_inbox_wake(suspenders_cr_t *cr) {
+    suspenders_worker_t *w = s_cr_worker(cr);
+    if (SUSPENDERS_UNLIKELY(!w)) return;   /* not yet pinned: still injector-owned */
+    if (suspenders_atomic_exchange(cr->wake_inflight, 1,
+                                   SUSPENDERS_MEMORY_ORDER_ACQ_REL) != 0) {
+        return;   /* already queued on the inbox */
+    }
+    uintptr_t head;
+    do {
+        head = suspenders_atomic_load(w->inbox, SUSPENDERS_MEMORY_ORDER_RELAXED);
+        cr->inbox_next = (suspenders_cr_t*)head;
+    } while (!suspenders_atomic_compare_exchange_weak(w->inbox, head, (uintptr_t)cr,
+                                                      SUSPENDERS_MEMORY_ORDER_SEQ_CST,
+                                                      SUSPENDERS_MEMORY_ORDER_RELAXED));
+    s_worker_signal(w);
+}
+
 /* Transport registry */
 static const suspenders_transport_ops_t *suspenders_transport_registry[16];
 static int suspenders_transport_count = 0;
 
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
-static void *suspenders_main_fiber = NULL;
+static SUSPENDERS_TLS void *suspenders_main_fiber = NULL;
 #endif
 
 /* ============================================================================
@@ -1086,14 +1238,29 @@ static inline void suspenders_ctx_switch(suspenders_ctx_t *old, suspenders_ctx_t
 /* ============================================================================
  * COROUTINE EXIT HANDLER
  * ============================================================================ */
+/* Owner-thread live list: linked when a cr pins to this worker, unlinked at
+ * exit. Whatever remains at teardown is a still-parked coroutine whose arena
+ * would otherwise leak on shutdown-while-busy. */
+static inline void s_live_link(suspenders_cr_t *cr) {
+    cr->live_prev = NULL;
+    cr->live_next = s_live_crs;
+    if (s_live_crs) s_live_crs->live_prev = cr;
+    s_live_crs = cr;
+}
+
+static inline void s_live_unlink(suspenders_cr_t *cr) {
+    if (cr->live_prev) cr->live_prev->live_next = cr->live_next;
+    else if (s_live_crs == cr) s_live_crs = cr->live_next;
+    if (cr->live_next) cr->live_next->live_prev = cr->live_prev;
+    cr->live_prev = cr->live_next = NULL;
+}
+
 static inline void suspenders_zombie_enqueue(suspenders_cr_t *cr) {
-    uintptr_t old_head;
-    do {
-        old_head = suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED);
-        cr->next = (suspenders_cr_t*)old_head;
-    } while (!suspenders_atomic_compare_exchange_weak(zombie_head, old_head, (uintptr_t)cr,
-                                                      SUSPENDERS_MEMORY_ORDER_RELEASE,
-                                                      SUSPENDERS_MEMORY_ORDER_RELAXED));
+    /* Coroutines are pinned: exit always happens on the owning worker, so
+     * the zombie list is plain TLS. */
+    s_live_unlink(cr);
+    cr->next = s_zombies;
+    s_zombies = cr;
 }
 
 /* Timer disarm is defined in the TIMERS section; forward-declared above. */
@@ -1112,7 +1279,13 @@ void suspenders_cr_exit(void) {
         }
         if (cr->state != SUSPENDERS_STATE_DONE) {
             cr->state = SUSPENDERS_STATE_DONE;
-            suspenders_atomic_fetch_sub(active_coroutines, 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
+            if (suspenders_atomic_fetch_sub(active_coroutines, 1,
+                    SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 1 &&
+                s_workers && s_worker != &s_workers[0]) {
+                /* Last coroutine finished on a helper: worker 0 may be parked
+                 * waiting to detect termination — kick it. */
+                s_worker_signal(&s_workers[0]);
+            }
         }
         suspenders_zombie_enqueue(cr);
         if (suspenders_main_cr) {
@@ -1234,17 +1407,46 @@ static void s_wait_park(suspenders_wq_list_t *list, suspenders_ticket_lock_t *lo
     node->cr = suspenders_running;
     node->data_ptr = data;
     node->status = S_WQ_WAITING;
+    node->waker_busy = 0;
     node->wait_list = list;
     node->wait_lock = lock;
     node->select_rec = NULL;
     s_wq_push(list, node);
 }
 
-/* Dequeue a waiter for a normal wake (caller holds the list's lock and
- * resumes n->cr after releasing it). */
+/* Decide a wait. The status flip is the linearization point: the waiter may
+ * observe it (via a stray wake) and race ahead without ever being resumed,
+ * recycling the node — or exiting and freeing the whole cr. waker_busy is
+ * set first so the waiter cannot return until the decider has finished its
+ * wake call; every grant MUST be followed by s_wait_decide_end after the
+ * resume/wake. */
 static inline void s_wait_grant(suspenders_wq_node_t *n, int status) {
+    n->waker_busy = 1;   /* seq_cst store, ordered before the status store */
     n->wait_list = NULL;
     n->status = status;
+}
+
+static inline void s_wait_decide_end(suspenders_wq_node_t *n) {
+    suspenders_atomic_store(n->waker_busy, 0, SUSPENDERS_MEMORY_ORDER_RELEASE);
+}
+
+/* Waiter side: wait out a decider still inside its grant→wake window. The
+ * decider may be a coroutine on this very worker that got preempted between
+ * the status flip and the wake, so yield while spinning. */
+static void s_wait_decider_sync(suspenders_wq_node_t *node) {
+    int spins = 0;
+    while (suspenders_atomic_load(node->waker_busy, SUSPENDERS_MEMORY_ORDER_ACQUIRE)) {
+        if (SUSPENDERS_UNLIKELY(++spins > 64)) {
+            suspenders_yield();
+            spins = 0;
+        } else {
+#if defined(SUSPENDERS_ARCH_X86_64)
+            __builtin_ia32_pause();
+#elif defined(SUSPENDERS_ARCH_AARCH64)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+    }
 }
 
 /* Suspend until the wait is decided; returns the final status. Consumes a
@@ -1253,6 +1455,7 @@ static inline void s_wait_grant(suspenders_wq_node_t *n, int status) {
 static int s_wait_block(void) {
     suspenders_wq_node_t *node = &suspenders_running->wq_node;
     while (node->status == S_WQ_WAITING) suspenders_suspend();
+    s_wait_decider_sync(node);
     node->wait_list = NULL;
     node->wait_lock = NULL;
     int st = node->status;
@@ -1263,6 +1466,8 @@ static int s_wait_block(void) {
     if (st != SUSPENDERS_OK) suspenders_errno = st;
     return st;
 }
+
+static void s_wait_finish_wake(suspenders_wq_node_t *n);
 
 /* Decide a parked wait from outside (cancel / deadline timer): unlink the
  * node under its structure's lock, write status, resume. Returns false if
@@ -1276,13 +1481,14 @@ static bool s_waiter_wake(suspenders_cr_t *cr, int status) {
     if (node->status == S_WQ_WAITING) {
         if (node->wait_list) {
             s_wq_remove(node->wait_list, node);
-            node->wait_list = NULL;
         }
+        node->waker_busy = 1;   /* before the status flip; see s_wait_grant */
+        node->wait_list = NULL;
         node->status = status;
         won = true;
     }
     if (lk) suspenders_ticket_unlock(lk);
-    if (won) suspenders_resume(cr);
+    if (won) s_wait_finish_wake(node);
     return won;
 }
 
@@ -1351,10 +1557,54 @@ void suspenders_suspend(void) {
 }
 
 void suspenders_resume(suspenders_cr_t *cr) {
-    if (SUSPENDERS_UNLIKELY(!cr || cr->state == SUSPENDERS_STATE_RUNNING || cr->state == SUSPENDERS_STATE_READY)) return;
+    if (SUSPENDERS_UNLIKELY(!cr)) return;
+    suspenders_worker_t *w = s_cr_worker(cr);
+    if (SUSPENDERS_UNLIKELY(w && w != s_worker)) {
+        /* Pinned to another worker: route through its inbox. The owner
+         * discards the wake if the cr turns out not to be suspended. */
+        s_inbox_wake(cr);
+        return;
+    }
+    if (cr->state == SUSPENDERS_STATE_RUNNING || cr->state == SUSPENDERS_STATE_READY ||
+        cr->state == SUSPENDERS_STATE_DONE) return;
     suspenders_ready_enqueue(cr);
     if (suspenders_running && suspenders_running != suspenders_main_cr &&
         suspenders_running->effective_qos > cr->effective_qos) {
+        suspenders_ready_enqueue(suspenders_running);
+        suspenders_ctx_switch(&suspenders_running->ctx, &suspenders_main_cr->ctx);
+    }
+}
+
+/* Wake a granted waiter without ever yielding. Batch grant/broadcast paths
+ * call this while still holding the structure's ticket lock — a node must
+ * not be touched after its grant (the waiter can observe the status and
+ * recycle it), so the wake has to happen inline, and the preempting
+ * suspenders_resume is off-limits under a spin lock. */
+static void s_wake_no_preempt(suspenders_cr_t *cr) {
+    if (SUSPENDERS_UNLIKELY(!cr)) return;
+    suspenders_worker_t *w = s_cr_worker(cr);
+    if (SUSPENDERS_UNLIKELY(w && w != s_worker)) {
+        s_inbox_wake(cr);
+        return;
+    }
+    if (cr->state == SUSPENDERS_STATE_RUNNING || cr->state == SUSPENDERS_STATE_READY ||
+        cr->state == SUSPENDERS_STATE_DONE) return;
+    suspenders_ready_enqueue(cr);
+}
+
+/* Wake after a grant, close the decider window, then honor QoS preemption.
+ * Call after releasing the structure's lock. The preempting
+ * suspenders_resume must not run while waker_busy is set: the woken cr
+ * would spin in s_wait_decider_sync while the strict QoS queues starve
+ * this (lower-priority) granter of the chance to clear the flag. */
+static void s_wait_finish_wake(suspenders_wq_node_t *n) {
+    suspenders_cr_t *cr = n->cr;
+    bool local = (s_cr_worker(cr) == s_worker);
+    int qos = suspenders_atomic_load(cr->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    s_wake_no_preempt(cr);
+    s_wait_decide_end(n);
+    if (local && suspenders_running && suspenders_running != suspenders_main_cr &&
+        suspenders_running->effective_qos > qos) {
         suspenders_ready_enqueue(suspenders_running);
         suspenders_ctx_switch(&suspenders_running->ctx, &suspenders_main_cr->ctx);
     }
@@ -1377,7 +1627,19 @@ int suspenders_cancel(suspenders_cr_t *cr) {
         suspenders_errno = SUSPENDERS_INVAL;
         return SUSPENDERS_INVAL;
     }
-    suspenders_atomic_store(cr->cancel_requested, 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
+    suspenders_atomic_store(cr->cancel_requested, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+    suspenders_worker_t *w = s_cr_worker(cr);
+    if (SUSPENDERS_UNLIKELY(w && w != s_worker)) {
+        /* Deliver on the owning worker (inbox consumer re-runs this logic
+         * locally): a foreign s_waiter_wake could read a stale wait_lock
+         * while the target re-parks, and I/O delivery touches the owner's
+         * ring/io_result. */
+        s_inbox_wake(cr);
+        return SUSPENDERS_OK;
+    }
+    /* Local: the target cannot be mid-park/re-park, so its wq fields are
+     * stable and the wait can be decided under the structure's lock. */
+    if (s_waiter_wake(cr, SUSPENDERS_CANCELED)) return SUSPENDERS_OK;
     if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
 #if SUSPENDERS_BACKEND_IOURING
         if (cr->pending_io) {
@@ -1385,11 +1647,9 @@ int suspenders_cancel(suspenders_cr_t *cr) {
             return SUSPENDERS_OK;   /* the op's own CQE delivers the wake */
         }
 #endif
-        if (!s_waiter_wake(cr, SUSPENDERS_CANCELED)) {
-            /* Blocked on readiness I/O or a bare suspend: deliver via io_result. */
-            cr->io_result = -1;
-            suspenders_resume(cr);
-        }
+        /* Blocked on readiness I/O or a bare suspend: deliver via io_result. */
+        cr->io_result = -1;
+        suspenders_resume(cr);
     }
     return SUSPENDERS_OK;
 }
@@ -1546,8 +1806,33 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
     cr->ctx.cr = cr;
 #endif
 
-    suspenders_ready_enqueue(cr);
-    suspenders_atomic_fetch_add(active_coroutines, 1, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    suspenders_atomic_fetch_add(active_coroutines, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+
+    if (s_num_workers > 1 || SUSPENDERS_UNLIKELY(!s_worker)) {
+        /* Fresh spawns go to the global injector; the coroutine pins to
+         * whichever worker takes it first. (Also the path for spawns from
+         * foreign threads, which have no local ready queue.) */
+        int q = suspenders_clamp_qos((int)qos);
+        suspenders_ticket_lock(&s_injector_lock);
+        cr->next = NULL;
+        if (s_injector_tails[q]) s_injector_tails[q]->next = cr;
+        else s_injector_heads[q] = cr;
+        s_injector_tails[q] = cr;
+        suspenders_atomic_fetch_add(s_injector_count, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        suspenders_ticket_unlock(&s_injector_lock);
+        for (unsigned i = 0; i < s_num_workers; i++) {
+            if (suspenders_atomic_load(s_workers[i].parked,
+                                       SUSPENDERS_MEMORY_ORDER_SEQ_CST)) {
+                s_worker_signal(&s_workers[i]);
+                break;
+            }
+        }
+    } else {
+        suspenders_atomic_store(cr->worker, (uintptr_t)s_worker,
+                                SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        s_live_link(cr);
+        suspenders_ready_enqueue(cr);
+    }
 
     return cr;
 }
@@ -1661,7 +1946,7 @@ static int s_chan_send_impl(suspenders_chan_t *ch, void *val,
         memcpy(rx->data_ptr, val, ch->elem_sz);
         s_wait_grant(rx, SUSPENDERS_OK);
         suspenders_ticket_unlock(&ch->lock);
-        suspenders_resume(rx->cr);
+        s_wait_finish_wake(rx);
         return SUSPENDERS_OK;
     }
 
@@ -1708,7 +1993,7 @@ static int s_chan_recv_impl(suspenders_chan_t *ch, void *out,
             s_chan_buf_push(ch, tx->data_ptr);
             s_wait_grant(tx, SUSPENDERS_OK);
             suspenders_ticket_unlock(&ch->lock);
-            suspenders_resume(tx->cr);
+            s_wait_finish_wake(tx);
         } else {
             suspenders_ticket_unlock(&ch->lock);
         }
@@ -1720,7 +2005,7 @@ static int s_chan_recv_impl(suspenders_chan_t *ch, void *out,
         memcpy(out, tx->data_ptr, ch->elem_sz);
         s_wait_grant(tx, SUSPENDERS_OK);
         suspenders_ticket_unlock(&ch->lock);
-        suspenders_resume(tx->cr);
+        s_wait_finish_wake(tx);
         return SUSPENDERS_OK;
     }
 
@@ -1780,25 +2065,19 @@ int suspenders_chan_close(suspenders_chan_t *ch) {
     ch->closed = true;
 
     /* Fail every parked waiter with CLOSED (buffered data stays drainable;
-     * receivers only park when the buffer is empty). */
-    suspenders_wq_node_t *wake = NULL, *wake_tail = NULL, *n;
+     * receivers only park when the buffer is empty). Grant+wake under the
+     * lock: a node is off-limits once its status is set. */
+    suspenders_wq_node_t *n;
     suspenders_wq_list_t *lists[2] = { &ch->senders, &ch->receivers };
     for (int i = 0; i < 2; i++) {
         while ((n = s_chan_take_waiter(lists[i])) != NULL) {
+            suspenders_cr_t *cr = n->cr;
             s_wait_grant(n, SUSPENDERS_CLOSED);
-            if (wake_tail) wake_tail->next = n;
-            else wake = n;
-            wake_tail = n;
+            s_wake_no_preempt(cr);
+            s_wait_decide_end(n);
         }
     }
     suspenders_ticket_unlock(&ch->lock);
-
-    while (wake) {
-        suspenders_wq_node_t *next = wake->next;
-        wake->next = NULL;
-        suspenders_resume(wake->cr);
-        wake = next;
-    }
     return SUSPENDERS_OK;
 }
 
@@ -1815,6 +2094,29 @@ static uint32_t s_rand32(void) {
     x ^= x << 5;
     s_select_seed = x;
     return x;
+}
+
+/* True when a select case could complete right now (caller holds ch->lock).
+ * Closes the lost-wakeup window between the lock-free try-scan and node
+ * registration: a counterpart that parked in that window saw no waiter and
+ * will never wake us. Nodes of this select (rec matches) don't count; stale
+ * losers of other selects do — the rescan pass discards them and re-parks. */
+static bool s_select_case_ready(const suspenders_chan_op_t *op,
+                                const s_select_rec_t *rec) {
+    suspenders_chan_t *ch = op->ch;
+    if (ch->closed) return true;
+    size_t count = suspenders_atomic_load(ch->count, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    const suspenders_wq_node_t *w;
+    if (op->is_send) {
+        if (ch->buf_sz && count < ch->buf_sz) return true;
+        for (w = ch->receivers.head; w; w = w->next)
+            if (w->select_rec != (const void*)rec) return true;
+    } else {
+        if (ch->buf_sz && count > 0) return true;
+        for (w = ch->senders.head; w; w = w->next)
+            if (w->select_rec != (const void*)rec) return true;
+    }
+    return false;
 }
 
 int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns) {
@@ -1856,25 +2158,10 @@ int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns)
     suspenders_wq_node_t *cnode = &cr->wq_node;
     cnode->cr = cr;
     cnode->status = S_WQ_WAITING;
+    cnode->waker_busy = 0;
     cnode->wait_list = NULL;
     cnode->wait_lock = NULL;
     cnode->select_rec = NULL;
-
-    for (int i = 0; i < n; i++) {
-        suspenders_wq_node_t *node = &nodes[i];
-        node->cr = cr;
-        node->data_ptr = ops[i].val;
-        node->status = S_WQ_WAITING;
-        node->select_rec = &rec;
-        node->select_idx = i;
-        suspenders_chan_t *ch = ops[i].ch;
-        suspenders_ticket_lock(&ch->lock);
-        suspenders_wq_list_t *list = ops[i].is_send ? &ch->senders : &ch->receivers;
-        node->wait_list = list;
-        node->wait_lock = &ch->lock;
-        s_wq_push(list, node);
-        suspenders_ticket_unlock(&ch->lock);
-    }
 
     suspenders_timer_t t;
     bool armed = false;
@@ -1886,24 +2173,81 @@ int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns)
         armed = s_timer_arm(&t);
     }
 
-    while (suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE) == -1 &&
-           cnode->status == S_WQ_WAITING) {
-        suspenders_suspend();
+    int widx = -1;
+    int scanidx = -1, scanst = 0;   /* case completed by a rescan pass */
+    for (;;) {
+        /* Register on every channel, re-checking readiness under each lock:
+         * a counterpart that parked after the try-scan never saw us and
+         * would never wake us. On readiness, stop and rescan instead. */
+        bool rescan = false;
+        int registered = 0;
+        for (int i = 0; i < n; i++) {
+            suspenders_wq_node_t *node = &nodes[i];
+            node->cr = cr;
+            node->data_ptr = ops[i].val;
+            node->status = S_WQ_WAITING;
+            node->waker_busy = 0;
+            node->select_rec = &rec;
+            node->select_idx = i;
+            suspenders_chan_t *ch = ops[i].ch;
+            suspenders_ticket_lock(&ch->lock);
+            if (s_select_case_ready(&ops[i], &rec)) {
+                suspenders_ticket_unlock(&ch->lock);
+                rescan = true;
+                break;
+            }
+            suspenders_wq_list_t *list = ops[i].is_send ? &ch->senders : &ch->receivers;
+            node->wait_list = list;
+            node->wait_lock = &ch->lock;
+            s_wq_push(list, node);
+            suspenders_ticket_unlock(&ch->lock);
+            registered++;
+        }
+
+        if (!rescan) {
+            while (suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE) == -1 &&
+                   cnode->status == S_WQ_WAITING) {
+                suspenders_suspend();
+            }
+        }
+
+        /* Unregister any node still parked (under each channel's lock). */
+        for (int i = 0; i < registered; i++) {
+            suspenders_chan_t *ch = ops[i].ch;
+            suspenders_ticket_lock(&ch->lock);
+            if (nodes[i].wait_list) {
+                s_wq_remove(nodes[i].wait_list, &nodes[i]);
+                nodes[i].wait_list = NULL;
+            }
+            suspenders_ticket_unlock(&ch->lock);
+        }
+
+        widx = suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE);
+        if (widx >= 0 || cnode->status != S_WQ_WAITING) break;
+        if (!rescan) break;   /* defensive: the wait loop always exits decided */
+
+        /* A case became ready mid-registration; no node is parked and no
+         * winner exists, so the try ops can run again safely. */
+        uint32_t r2 = s_rand32();
+        for (int i = 0; i < n && scanidx < 0; i++) {
+            int idx = (int)((r2 + (uint32_t)i) % (uint32_t)n);
+            suspenders_chan_op_t *op = &ops[idx];
+            int st = op->is_send ? suspenders_chan_try_send(op->ch, op->val)
+                                 : suspenders_chan_try_recv(op->ch, op->val);
+            if (st == SUSPENDERS_OK || st == SUSPENDERS_CLOSED) {
+                scanidx = idx;
+                scanst = st;
+            }
+        }
+        if (scanidx >= 0) break;
+        /* Someone else consumed it — park again. */
     }
     if (armed) s_timer_disarm(&t);
-
-    /* Unregister any node still parked (under each channel's lock). */
-    for (int i = 0; i < n; i++) {
-        suspenders_chan_t *ch = ops[i].ch;
-        suspenders_ticket_lock(&ch->lock);
-        if (nodes[i].wait_list) {
-            s_wq_remove(nodes[i].wait_list, &nodes[i]);
-            nodes[i].wait_list = NULL;
-        }
-        suspenders_ticket_unlock(&ch->lock);
-    }
-
-    int widx = suspenders_atomic_load(rec.winner, SUSPENDERS_MEMORY_ORDER_ACQUIRE);
+    /* The winning channel (possibly on another worker) and any cancel/
+     * deadline decider may still be inside their grant→wake window; the
+     * stack nodes and this coroutine must outlive them. */
+    if (widx >= 0) s_wait_decider_sync(&nodes[widx]);
+    s_wait_decider_sync(cnode);
     int st = cnode->status;
     cnode->status = SUSPENDERS_OK;   /* never leave a stale WAITING marker */
 
@@ -1912,6 +2256,13 @@ int suspenders_select_dl(suspenders_chan_op_t *ops, int n, uint64_t deadline_ns)
         suspenders_errno = nodes[widx].status == SUSPENDERS_CLOSED ? SUSPENDERS_CLOSED
                                                                    : SUSPENDERS_OK;
         return widx;
+    }
+
+    if (scanidx >= 0) {
+        /* A rescan pass completed the op. If a cancel/deadline raced in,
+         * the flag stays pending and the next blocking call reports it. */
+        suspenders_errno = scanst;
+        return scanidx;
     }
 
     if (st == SUSPENDERS_CANCELED) {
@@ -2007,6 +2358,7 @@ static void s_mutex_lock_raw(suspenders_mutex_t *m) {
     suspenders_wq_node_t *node = &cr->wq_node;
     for (;;) {
         while (node->status == S_WQ_WAITING) suspenders_suspend();
+        s_wait_decider_sync(node);
         if (node->status == SUSPENDERS_OK) break;
         /* Canceled/timed out while re-locking: keep waiting for the lock,
          * the failure was already reported by the wait that preceded it. */
@@ -2043,7 +2395,7 @@ int suspenders_mutex_unlock(suspenders_mutex_t *m) {
         m->owner = n->cr;
         s_wait_grant(n, SUSPENDERS_OK);
         suspenders_ticket_unlock(&m->lock);
-        suspenders_resume(n->cr);
+        s_wait_finish_wake(n);
     } else {
         m->owner = NULL;
         suspenders_ticket_unlock(&m->lock);
@@ -2159,33 +2511,30 @@ int suspenders_rwlock_unlock(suspenders_rwlock_t *rw) {
         return SUSPENDERS_PERM;
     }
 
-    /* Grant the head of the queue: one writer, or a batch of readers. */
-    suspenders_wq_node_t *granted = NULL, *granted_tail = NULL;
+    /* Grant the head of the queue: one writer, or a batch of readers.
+     * Grant+wake happen in one step under the lock — a node is off-limits
+     * the moment its status is set (the waiter may already be spinning in
+     * s_wait_block on another worker and recycle it). */
     if (rw->readers == 0 && !rw->writer && rw->waiters.head) {
         if (rw->waiters.head->data_ptr == S_RW_WRITER) {
             suspenders_wq_node_t *n = s_wq_pop(&rw->waiters);
+            suspenders_cr_t *cr = n->cr;
             rw->writer = true;
             s_wait_grant(n, SUSPENDERS_OK);
-            granted = granted_tail = n;
+            s_wake_no_preempt(cr);
+            s_wait_decide_end(n);
         } else {
             while (rw->waiters.head && rw->waiters.head->data_ptr != S_RW_WRITER) {
                 suspenders_wq_node_t *n = s_wq_pop(&rw->waiters);
+                suspenders_cr_t *cr = n->cr;
                 rw->readers++;
                 s_wait_grant(n, SUSPENDERS_OK);
-                if (granted_tail) granted_tail->next = n;
-                else granted = n;
-                granted_tail = n;
+                s_wake_no_preempt(cr);
+                s_wait_decide_end(n);
             }
         }
     }
     suspenders_ticket_unlock(&rw->lock);
-
-    while (granted) {
-        suspenders_wq_node_t *next = granted->next;
-        granted->next = NULL;
-        suspenders_resume(granted->cr);
-        granted = next;
-    }
     return SUSPENDERS_OK;
 }
 
@@ -2233,7 +2582,7 @@ int suspenders_cond_signal(suspenders_cond_t *c) {
     suspenders_wq_node_t *n = s_wq_pop(&c->waiters);
     if (n) s_wait_grant(n, SUSPENDERS_OK);
     suspenders_ticket_unlock(&c->lock);
-    if (n) suspenders_resume(n->cr);
+    if (n) s_wait_finish_wake(n);
     return SUSPENDERS_OK;
 }
 
@@ -2243,18 +2592,20 @@ int suspenders_cond_broadcast(suspenders_cond_t *c) {
         return SUSPENDERS_INVAL;
     }
     suspenders_ticket_lock(&c->lock);
-    suspenders_wq_node_t *head = c->waiters.head;
-    for (suspenders_wq_node_t *n = head; n; n = n->next) {
-        s_wait_grant(n, SUSPENDERS_OK);
-    }
+    /* Grant+wake under the lock; read `next` before the grant makes the
+     * node off-limits (the waiter may recycle it immediately). */
+    suspenders_wq_node_t *n = c->waiters.head;
     c->waiters.head = c->waiters.tail = NULL;
-    suspenders_ticket_unlock(&c->lock);
-    while (head) {
-        suspenders_wq_node_t *next = head->next;
-        head->next = NULL;
-        suspenders_resume(head->cr);
-        head = next;
+    while (n) {
+        suspenders_wq_node_t *next = n->next;
+        suspenders_cr_t *cr = n->cr;
+        n->next = NULL;
+        s_wait_grant(n, SUSPENDERS_OK);
+        s_wake_no_preempt(cr);
+        s_wait_decide_end(n);
+        n = next;
     }
+    suspenders_ticket_unlock(&c->lock);
     return SUSPENDERS_OK;
 }
 
@@ -2277,21 +2628,22 @@ int suspenders_waitgroup_add(suspenders_waitgroup_t *wg, int delta) {
         return SUSPENDERS_INVAL;
     }
     wg->count += delta;
-    suspenders_wq_node_t *head = NULL;
     if (wg->count == 0 && wg->waiters.head) {
-        head = wg->waiters.head;
-        for (suspenders_wq_node_t *n = head; n; n = n->next) {
-            s_wait_grant(n, SUSPENDERS_OK);
-        }
+        /* Grant+wake under the lock; read `next` before the grant makes
+         * the node off-limits (the waiter may recycle it immediately). */
+        suspenders_wq_node_t *n = wg->waiters.head;
         wg->waiters.head = wg->waiters.tail = NULL;
+        while (n) {
+            suspenders_wq_node_t *next = n->next;
+            suspenders_cr_t *cr = n->cr;
+            n->next = NULL;
+            s_wait_grant(n, SUSPENDERS_OK);
+            s_wake_no_preempt(cr);
+            s_wait_decide_end(n);
+            n = next;
+        }
     }
     suspenders_ticket_unlock(&wg->lock);
-    while (head) {
-        suspenders_wq_node_t *next = head->next;
-        head->next = NULL;
-        suspenders_resume(head->cr);
-        head = next;
-    }
     return SUSPENDERS_OK;
 }
 
@@ -2437,6 +2789,16 @@ static void s_iou_cancel(void *io_op) {
     io_uring_submit(&suspenders_backend->ring);
 }
 
+/* Arm (or re-arm) the one-shot readability poll on this worker's wake fd.
+ * Its CQE carries the worker's sentinel op (op->cr == NULL). */
+static void s_iou_arm_wake(suspenders_worker_t *w) {
+    if (!w || w->wake_rd < 0 || !w->wake_op) return;
+    struct io_uring_sqe *sqe = s_iou_get_sqe();
+    if (SUSPENDERS_UNLIKELY(!sqe)) return;
+    io_uring_prep_poll_add(sqe, (int)w->wake_rd, POLLIN);
+    io_uring_sqe_set_data(sqe, w->wake_op);
+}
+
 /* Prep + park for one completion-mode op. Callers guarantee a real coroutine
  * context and that entry cancel/deadline checks already ran (s_io_pre). */
 static ssize_t s_iou_op(int code, suspenders_sock_t fd,
@@ -2520,12 +2882,19 @@ static int s_iou_flush_cqes(suspenders_backend_t *be) {
     io_uring_for_each_cqe(&be->ring, head, cqe) {
         suspenders_io_op_t *op = (suspenders_io_op_t*)io_uring_cqe_get_data(cqe);
         if (op) {   /* NULL user_data: link-timeout / async-cancel CQE */
-            op->result = cqe->res;
-            op->completed = true;
-            if (op->cr->state == SUSPENDERS_STATE_SUSPENDED) {
-                suspenders_ready_enqueue(op->cr);
+            if (SUSPENDERS_UNLIKELY(!op->cr)) {
+                /* Worker wake sentinel: drain the eventfd, re-arm the poll. */
+                s_wake_drain(s_worker);
+                s_iou_arm_wake(s_worker);
+                found++;
+            } else {
+                op->result = cqe->res;
+                op->completed = true;
+                if (op->cr->state == SUSPENDERS_STATE_SUSPENDED) {
+                    suspenders_ready_enqueue(op->cr);
+                }
+                found++;
             }
-            found++;
         }
         seen++;
     }
@@ -2623,8 +2992,14 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
     int n = kevent(be->kqueue.kq, NULL, 0, be->kqueue.events, be->kqueue.events_cap, tsp);
     for (int i = 0; i < n; i++) {
         suspenders_cr_t *cr = (suspenders_cr_t*)be->kqueue.events[i].udata;
-        if (cr && cr->state == SUSPENDERS_STATE_SUSPENDED) {
-            suspenders_ready_enqueue(cr);
+        if (cr) {
+            if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
+                suspenders_ready_enqueue(cr);
+            }
+        } else if (s_worker) {
+            /* Worker wake fd (registered one-shot): drain and re-arm. */
+            s_wake_drain(s_worker);
+            s_backend_register(be, s_worker->wake_rd, POLLIN, NULL);
         }
     }
     return n;
@@ -2718,18 +3093,24 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
     int j = 0;
     int found = 0;
     for (int i = 0; i < be->poll.nfds; i++) {
+        suspenders_cr_t *cr = be->poll.crs[i];
         if (be->poll.fds[i].revents) {
-            suspenders_cr_t *cr = be->poll.crs[i];
-            if (cr && cr->state == SUSPENDERS_STATE_SUSPENDED) {
-                suspenders_ready_enqueue(cr);
-                found++;
+            if (cr) {
+                if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
+                    suspenders_ready_enqueue(cr);
+                    found++;
+                }
+                /* One-shot: don't copy back to array */
+                continue;
             }
-            /* One-shot: don't copy back to array */
-        } else {
-            be->poll.fds[j] = be->poll.fds[i];
-            be->poll.crs[j] = be->poll.crs[i];
-            j++;
+            /* NULL cr: this worker's wake fd — drain and keep registered. */
+            s_wake_drain(s_worker);
+            found++;
+            be->poll.fds[i].revents = 0;
         }
+        be->poll.fds[j] = be->poll.fds[i];
+        be->poll.crs[j] = be->poll.crs[i];
+        j++;
     }
     be->poll.nfds = j;
     return found;
@@ -3802,6 +4183,7 @@ int suspenders_sleep_dl(uint64_t deadline_ns) {
     suspenders_wq_node_t *node = &cr->wq_node;
     node->cr = cr;
     node->status = S_WQ_WAITING;
+    node->waker_busy = 0;
     node->wait_list = NULL;
     node->wait_lock = NULL;
 
@@ -3977,15 +4359,281 @@ void suspenders_pool_submit(suspenders_pool_t *pool,
 /* ============================================================================
  * SCHEDULER INITIALIZATION & LIFECYCLE
  * ============================================================================ */
-int suspenders_init(unsigned num_workers, unsigned queue_hint) {
-    (void)num_workers;
+/* Reap this worker's finished coroutines (plain TLS list; crs are pinned). */
+static void s_zombie_reap(void) {
+    while (s_zombies) {
+        suspenders_cr_t *zombie = s_zombies;
+        s_zombies = zombie->next;
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+        if (zombie->ctx.fiber && zombie->ctx.fiber != suspenders_main_fiber) {
+            DeleteFiber(zombie->ctx.fiber);
+        }
+#endif
+        /* The cr_t lives inside its arena; destroying it frees both. The
+         * arena is stamped with its creating heap, so this is foreign-safe
+         * when the spawner ran on another thread. */
+        memento_arena_t *arena = zombie->arena;
+        if (arena) memento_arena_destroy(arena);
+    }
+}
 
+/* Shutdown-while-busy reclaim: destroy the arenas of this worker's still-
+ * parked coroutines. Only safe at teardown — after the worker loop has
+ * exited (helpers) or all helpers are joined (worker 0) — when nothing can
+ * wake or run them anymore. Their stacks are simply discarded; cleanup
+ * handlers do not run (documented shutdown semantics). */
+static void s_live_reap(void) {
+    while (s_live_crs) {
+        suspenders_cr_t *cr = s_live_crs;
+        s_live_crs = cr->live_next;
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+        if (cr->ctx.fiber && cr->ctx.fiber != suspenders_main_fiber) {
+            DeleteFiber(cr->ctx.fiber);
+        }
+#endif
+        if (cr->arena) memento_arena_destroy(cr->arena);
+    }
+}
+
+/* Take one coroutine from the global injector and pin it to this worker. */
+static suspenders_cr_t* s_injector_take(void) {
+    if (suspenders_atomic_load(s_injector_count, SUSPENDERS_MEMORY_ORDER_RELAXED) == 0) {
+        return NULL;
+    }
+    suspenders_cr_t *cr = NULL;
+    suspenders_ticket_lock(&s_injector_lock);
+    for (int q = 0; q < SUSPENDERS_QOS_COUNT; q++) {
+        cr = s_injector_heads[q];
+        if (cr) {
+            s_injector_heads[q] = cr->next;
+            if (!s_injector_heads[q]) s_injector_tails[q] = NULL;
+            cr->next = NULL;
+            suspenders_atomic_fetch_sub(s_injector_count, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+            break;
+        }
+    }
+    suspenders_ticket_unlock(&s_injector_lock);
+    if (cr) {
+        suspenders_atomic_store(cr->worker, (uintptr_t)s_worker,   /* pin: all
+                                future wakes come here */
+                                SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        s_live_link(cr);
+        /* A cancel that raced ahead of the first run had no worker to
+         * deliver to; carry it as a pending wake so the first switch-out
+         * (even a bare suspend) delivers it. */
+        if (SUSPENDERS_UNLIKELY(suspenders_atomic_load(cr->cancel_requested,
+                                    SUSPENDERS_MEMORY_ORDER_SEQ_CST) != 0)) {
+            cr->pending_wake = 1;
+        }
+    }
+    return cr;
+}
+
+/* Deliver one inbox wake on the owning worker. A pending cancel re-runs the
+ * cancel delivery locally, where the ring and io_result are safe to touch.
+ * A wake for a coroutine that is not suspended (it was READY: an earlier
+ * wake already queued it) is recorded in pending_wake and re-delivered when
+ * the cr next switches out — dropping it would lose a grant whose inbox
+ * push was deduped against this entry. */
+static void s_inbox_deliver(suspenders_cr_t *cr) {
+    if (SUSPENDERS_UNLIKELY(suspenders_atomic_load(cr->cancel_requested,
+                                SUSPENDERS_MEMORY_ORDER_SEQ_CST) != 0)) {
+        if (s_waiter_wake(cr, SUSPENDERS_CANCELED)) return;
+#if SUSPENDERS_BACKEND_IOURING
+        if (cr->pending_io) {
+            s_iou_cancel(cr->pending_io);
+            return;
+        }
+#endif
+        if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
+            cr->io_result = -1;
+            suspenders_ready_enqueue(cr);
+        } else if (cr->state != SUSPENDERS_STATE_DONE) {
+            cr->pending_wake = 1;
+        }
+        return;
+    }
+    if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
+        suspenders_ready_enqueue(cr);
+    } else if (cr->state != SUSPENDERS_STATE_DONE) {
+        cr->pending_wake = 1;
+    }
+}
+
+/* Consume this worker's inbox. */
+static void s_inbox_drain(void) {
+    uintptr_t head = suspenders_atomic_exchange(s_worker->inbox, 0,
+                                                SUSPENDERS_MEMORY_ORDER_ACQUIRE);
+    suspenders_cr_t *rev = NULL;
+    suspenders_cr_t *list = (suspenders_cr_t*)head;
+    while (list) {   /* reverse the LIFO stack for FIFO fairness */
+        suspenders_cr_t *n = list->inbox_next;
+        list->inbox_next = rev;
+        rev = list;
+        list = n;
+    }
+    while (rev) {
+        suspenders_cr_t *cr = rev;
+        rev = rev->inbox_next;
+        cr->inbox_next = NULL;
+        suspenders_atomic_store(cr->wake_inflight, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        s_inbox_deliver(cr);
+    }
+}
+
+/* True when the whole runtime is out of work (worker 0's exit condition). */
+static bool s_run_complete(void) {
+    return suspenders_ready_queue_empty() &&
+           suspenders_atomic_load(s_worker->inbox, SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 0 &&
+           suspenders_atomic_load(s_injector_count, SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 0 &&
+           suspenders_atomic_load(active_coroutines, SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 0 &&
+           suspenders_timer_heap.count == 0;
+}
+
+/* The scheduler loop every worker runs. Worker 0 (the suspenders_run
+ * caller) exits when the runtime drains; helpers run until shutdown. */
+static void s_worker_loop(bool is_run_caller) {
+    suspenders_worker_t *w = s_worker;
+    for (;;) {
+        if (SUSPENDERS_UNLIKELY(suspenders_atomic_load(s_stop,
+                                    SUSPENDERS_MEMORY_ORDER_ACQUIRE))) break;
+
+        if (suspenders_atomic_load(w->inbox, SUSPENDERS_MEMORY_ORDER_RELAXED)) {
+            s_inbox_drain();
+        }
+
+        suspenders_cr_t *cr = suspenders_ready_dequeue();
+        if (!cr) cr = s_injector_take();
+        if (cr) {
+            suspenders_running = cr;
+            cr->state = SUSPENDERS_STATE_RUNNING;
+            suspenders_ctx_switch(&suspenders_main_cr->ctx, &cr->ctx);
+            suspenders_running = suspenders_main_cr;
+            /* A wake arrived (via inbox) while the cr was READY/RUNNING and
+             * could not be delivered then; it may have been meant for the
+             * park the cr just entered — re-deliver now. */
+            if (SUSPENDERS_UNLIKELY(cr->pending_wake) &&
+                cr->state != SUSPENDERS_STATE_DONE) {
+                cr->pending_wake = 0;
+                s_inbox_deliver(cr);
+            }
+            continue;
+        }
+
+        s_zombie_reap();
+
+        if (is_run_caller && s_run_complete()) break;
+
+        /* Idle: flush foreign frees back to our heap, then park. */
+        int timeout_ms = -1;
+        if (suspenders_timer_heap.count > 0) {
+            uint64_t now = suspenders_now_ns();
+            uint64_t next = suspenders_timer_heap.data[0]->deadline_ns;
+            if (next <= now) {
+                timeout_ms = 0;
+            } else {
+                uint64_t delta_ns = next - now;
+                timeout_ms = (int)(delta_ns / 1000000);
+                if (timeout_ms < 1) timeout_ms = 1;
+            }
+        }
+        memento_thread_heap_flush(memento_thread_heap_get());
+        /* Park protocol: set parked, then re-check every wake source
+         * (including run-completion for worker 0). A producer either sees
+         * parked==1 and writes the eventfd, or we see its work here. */
+        suspenders_atomic_store(w->parked, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        if (suspenders_atomic_load(w->inbox, SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 0 &&
+            suspenders_atomic_load(s_injector_count, SUSPENDERS_MEMORY_ORDER_SEQ_CST) == 0 &&
+            !suspenders_atomic_load(s_stop, SUSPENDERS_MEMORY_ORDER_SEQ_CST) &&
+            !(is_run_caller && s_run_complete())) {
+            if (suspenders_backend) {
+                s_backend_wait(suspenders_backend, timeout_ms);
+            } else if (timeout_ms > 0) {
+                struct timespec ts;
+                ts.tv_sec = timeout_ms / 1000;
+                ts.tv_nsec = (timeout_ms % 1000) * 1000000LL;
+                nanosleep(&ts, NULL);
+            }
+        }
+        suspenders_atomic_store(w->parked, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+        suspenders_timer_fire_expired();
+    }
+}
+
+/* Register this worker's wake fd with its (thread-local) backend. */
+static void s_worker_register_wake(suspenders_worker_t *w) {
+#if SUSPENDERS_BACKEND_IOURING
+    s_iou_arm_wake(w);
+#elif !defined(SUSPENDERS_PLATFORM_WINDOWS)
+    s_backend_register(suspenders_backend, w->wake_rd, POLLIN, NULL);
+#else
+    (void)w;
+#endif
+}
+
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+static void* s_worker_thread_main(void *arg) {
+    suspenders_worker_t *w = (suspenders_worker_t*)arg;
+    s_worker = w;
+
+#if defined(SUSPENDERS_PIN_WORKERS) && SUSPENDERS_PLATFORM_LINUX
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0) {
+        CPU_SET((unsigned)w->index % (unsigned)ncpu, &cpus);
+        (void)pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+    }
+#endif
+
+    if (SUSPENDERS_UNLIKELY(!memento_thread_heap_get())) return NULL;
+    suspenders_backend = s_backend_create(s_queue_hint);
+    if (SUSPENDERS_UNLIKELY(!suspenders_backend)) return NULL;
+
+#if SUSPENDERS_BACKEND_IOURING
+    static SUSPENDERS_TLS suspenders_io_op_t s_wake_op_tls;
+    memset(&s_wake_op_tls, 0, sizeof(s_wake_op_tls));   /* cr == NULL: sentinel */
+    w->wake_op = &s_wake_op_tls;
+#endif
+    s_worker_register_wake(w);
+
+    s_main_cr_get();
+    suspenders_running = suspenders_main_cr;
+    suspenders_main_cr->state = SUSPENDERS_STATE_RUNNING;
+    suspenders_initialized = 1;
+
+    s_worker_loop(false);
+
+    /* Teardown: this thread's zombies, still-parked coroutines, timers,
+     * backend; the memento TLS destructor retires the heap (drained by
+     * memento_shutdown). */
+    s_zombie_reap();
+    s_live_reap();
+    if (suspenders_timer_heap.data) {
+        memento_thread_heap_free(memento_thread_heap_get(),
+                                 suspenders_timer_heap.data,
+                                 suspenders_timer_heap.cap * sizeof(suspenders_timer_t*));
+        memset(&suspenders_timer_heap, 0, sizeof(suspenders_timer_heap));
+    }
+    s_backend_destroy(suspenders_backend);
+    suspenders_backend = NULL;
+    suspenders_main_cr = NULL;
+    suspenders_running = NULL;
+    suspenders_initialized = 0;
+    return NULL;
+}
+#endif /* !Windows */
+
+int suspenders_init(unsigned num_workers, unsigned queue_hint) {
     memento_init();
     memento_thread_heap_t *heap = memento_thread_heap_get();
     if (SUSPENDERS_UNLIKELY(!heap)) {
         suspenders_errno = SUSPENDERS_NOMEM;
         return SUSPENDERS_NOMEM;
     }
+
+    if (queue_hint == 0) queue_hint = 256;
+    s_queue_hint = queue_hint;
 
     suspenders_backend = s_backend_create(queue_hint);
     if (SUSPENDERS_UNLIKELY(!suspenders_backend)) {
@@ -4003,6 +4651,79 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (num_workers > 1) num_workers = 1;   /* multi-worker is POSIX-only */
+#endif
+    if (num_workers == 0) num_workers = 1;
+
+    suspenders_atomic_store(s_stop, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+    suspenders_ticket_init(&s_injector_lock);
+    memset(s_injector_heads, 0, sizeof(s_injector_heads));
+    memset(s_injector_tails, 0, sizeof(s_injector_tails));
+    suspenders_atomic_store(s_injector_count, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+
+    /* sizeof(worker) is a multiple of the cache line (aligned first member),
+     * as aligned_alloc requires. */
+    s_workers = (suspenders_worker_t*)aligned_alloc(
+        SUSPENDERS_CACHELINE, num_workers * sizeof(suspenders_worker_t));
+    if (SUSPENDERS_UNLIKELY(!s_workers)) {
+        s_backend_destroy(suspenders_backend);
+        suspenders_backend = NULL;
+        suspenders_errno = SUSPENDERS_NOMEM;
+        return SUSPENDERS_NOMEM;
+    }
+    memset(s_workers, 0, num_workers * sizeof(suspenders_worker_t));
+    s_num_workers = num_workers;
+    for (unsigned i = 0; i < num_workers; i++) {
+        suspenders_worker_t *w = &s_workers[i];
+        w->index = (int)i;
+        suspenders_atomic_init(w->inbox, 0);
+        suspenders_atomic_init(w->parked, 0);
+        if (!s_wake_fd_create(w)) {
+            for (unsigned j = 0; j < i; j++) s_wake_fd_destroy(&s_workers[j]);
+            free(s_workers);
+            s_workers = NULL;
+            s_num_workers = 0;
+            s_backend_destroy(suspenders_backend);
+            suspenders_backend = NULL;
+            suspenders_errno = SUSPENDERS_ERROR;
+            return SUSPENDERS_ERROR;
+        }
+    }
+
+    s_worker = &s_workers[0];
+#if SUSPENDERS_BACKEND_IOURING
+    {
+        static SUSPENDERS_TLS suspenders_io_op_t s_wake_op_w0;
+        memset(&s_wake_op_w0, 0, sizeof(s_wake_op_w0));
+        s_workers[0].wake_op = &s_wake_op_w0;
+    }
+#endif
+    s_worker_register_wake(&s_workers[0]);
+
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    for (unsigned i = 1; i < num_workers; i++) {
+        if (pthread_create(&s_workers[i].thread, NULL,
+                           s_worker_thread_main, &s_workers[i]) != 0) {
+            /* Roll back: stop the helpers we did start. */
+            suspenders_atomic_store(s_stop, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+            for (unsigned j = 1; j < i; j++) {
+                uint64_t one = 1;
+                ssize_t r = write(s_workers[j].wake_wr, &one, sizeof(one));
+                (void)r;
+                pthread_join(s_workers[j].thread, NULL);
+            }
+            for (unsigned j = 0; j < num_workers; j++) s_wake_fd_destroy(&s_workers[j]);
+            free(s_workers);
+            s_workers = NULL;
+            s_num_workers = 0;
+            s_worker = NULL;
+            s_backend_destroy(suspenders_backend);
+            suspenders_backend = NULL;
+            suspenders_atomic_store(s_stop, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+            suspenders_errno = SUSPENDERS_ERROR;
+            return SUSPENDERS_ERROR;
+        }
+    }
 #endif
 
     suspenders_initialized = 1;
@@ -4016,88 +4737,85 @@ void suspenders_run(void) {
     }
 
     s_main_cr_get();
-
     suspenders_running = suspenders_main_cr;
     suspenders_main_cr->state = SUSPENDERS_STATE_RUNNING;
 
-    while (1) {
-        suspenders_cr_t *cr = suspenders_ready_dequeue();
-        if (cr) {
-            suspenders_running = cr;
-            cr->state = SUSPENDERS_STATE_RUNNING;
-            suspenders_ctx_switch(&suspenders_main_cr->ctx, &cr->ctx);
-            suspenders_running = suspenders_main_cr;
-            continue;
-        }
-
-        while (suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED)) {
-            suspenders_cr_t *zombie = (suspenders_cr_t*)suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED);
-            suspenders_atomic_store(zombie_head, (uintptr_t)zombie->next, SUSPENDERS_MEMORY_ORDER_RELAXED);
-#ifdef SUSPENDERS_PLATFORM_WINDOWS
-            if (zombie->ctx.fiber && zombie->ctx.fiber != suspenders_main_fiber) {
-                DeleteFiber(zombie->ctx.fiber);
-            }
-#endif
-            /* The cr_t lives inside its arena; destroying it frees both. */
-            memento_arena_t *arena = zombie->arena;
-            if (arena) memento_arena_destroy(arena);
-        }
-
-        if (suspenders_ready_queue_empty() &&
-            suspenders_atomic_load(active_coroutines, SUSPENDERS_MEMORY_ORDER_RELAXED) == 0 &&
-            suspenders_timer_heap.count == 0) {
-            break;
-        }
-
-        if (suspenders_ready_queue_empty()) {
-            int timeout_ms = -1;
-            if (suspenders_timer_heap.count > 0) {
-                uint64_t now = suspenders_now_ns();
-                uint64_t next = suspenders_timer_heap.data[0]->deadline_ns;
-                if (next <= now) {
-                    timeout_ms = 0;
-                } else {
-                    uint64_t delta_ns = next - now;
-                    timeout_ms = (int)(delta_ns / 1000000);
-                    if (timeout_ms < 1) timeout_ms = 1;
-                }
-            }
-            if (suspenders_backend) {
-                s_backend_wait(suspenders_backend, timeout_ms);
-            } else if (timeout_ms > 0) {
-                struct timespec ts;
-                ts.tv_sec = timeout_ms / 1000;
-                ts.tv_nsec = (timeout_ms % 1000) * 1000000LL;
-                nanosleep(&ts, NULL);
-            }
-            suspenders_timer_fire_expired();
-        }
-    }
+    s_worker_loop(true);
 
     suspenders_main_cr->state = SUSPENDERS_STATE_READY;
 }
 
 void suspenders_shutdown(void) {
-    if (suspenders_initialized) {
-        if (suspenders_backend) {
-            s_backend_destroy(suspenders_backend);
-            suspenders_backend = NULL;
-        }
-        if (suspenders_timer_heap.data) {
-            memento_thread_heap_free(memento_thread_heap_get(),
-                                     suspenders_timer_heap.data,
-                                     suspenders_timer_heap.cap * sizeof(suspenders_timer_t*));
-            memset(&suspenders_timer_heap, 0, sizeof(suspenders_timer_heap));
-        }
-        /* Reset per-thread scheduler identity so a re-init starts clean. */
-        suspenders_main_cr = NULL;
-        suspenders_running = NULL;
-        memento_shutdown();
-        suspenders_initialized = 0;
-#ifdef SUSPENDERS_PLATFORM_WINDOWS
-        WSACleanup();
+    if (!suspenders_initialized) return;
+
+    suspenders_atomic_store(s_stop, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+#ifndef SUSPENDERS_PLATFORM_WINDOWS
+    for (unsigned i = 1; i < s_num_workers; i++) {
+        /* Unconditional kick (skip the parked-flag fast path). */
+#if SUSPENDERS_PLATFORM_LINUX
+        uint64_t one = 1;
+        ssize_t r = write(s_workers[i].wake_wr, &one, sizeof(one));
+#else
+        char one = 1;
+        ssize_t r = write(s_workers[i].wake_wr, &one, 1);
 #endif
+        (void)r;
     }
+    for (unsigned i = 1; i < s_num_workers; i++) {
+        pthread_join(s_workers[i].thread, NULL);
+    }
+#endif
+
+    /* Coroutines that never ran (still in the injector) are reclaimed here. */
+    for (int q = 0; q < SUSPENDERS_QOS_COUNT; q++) {
+        while (s_injector_heads[q]) {
+            suspenders_cr_t *cr = s_injector_heads[q];
+            s_injector_heads[q] = cr->next;
+            if (cr->arena) memento_arena_destroy(cr->arena);
+        }
+        s_injector_tails[q] = NULL;
+    }
+    suspenders_atomic_store(s_injector_count, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+    s_zombie_reap();
+    /* Coroutines still parked on this worker (shutdown-while-busy) are
+     * reclaimed from the live list; helpers reclaimed theirs before join.
+     * Abandoned coroutines kept the count nonzero; reset for re-init. */
+    s_live_reap();
+    /* The reaped crs may still be linked into this worker's ready queues
+     * (shutdown without run); reset the queues so re-init starts clean. */
+    for (int q = 0; q < SUSPENDERS_QOS_COUNT; q++) {
+        ready_queue_heads[q] = NULL;
+        ready_queue_tails[q] = NULL;
+    }
+    suspenders_atomic_store(active_coroutines, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+
+    if (suspenders_backend) {
+        s_backend_destroy(suspenders_backend);
+        suspenders_backend = NULL;
+    }
+    if (suspenders_timer_heap.data) {
+        memento_thread_heap_free(memento_thread_heap_get(),
+                                 suspenders_timer_heap.data,
+                                 suspenders_timer_heap.cap * sizeof(suspenders_timer_t*));
+        memset(&suspenders_timer_heap, 0, sizeof(suspenders_timer_heap));
+    }
+    if (s_workers) {
+        for (unsigned i = 0; i < s_num_workers; i++) s_wake_fd_destroy(&s_workers[i]);
+        free(s_workers);
+        s_workers = NULL;
+    }
+    s_num_workers = 0;
+    s_worker = NULL;
+    suspenders_atomic_store(s_stop, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+
+    /* Reset per-thread scheduler identity so a re-init starts clean. */
+    suspenders_main_cr = NULL;
+    suspenders_running = NULL;
+    memento_shutdown();
+    suspenders_initialized = 0;
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+    WSACleanup();
+#endif
 }
 
 #ifdef __cplusplus
