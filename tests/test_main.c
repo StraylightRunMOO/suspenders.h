@@ -1100,7 +1100,12 @@ static int test_channel_buffered(void) {
     suspenders_shutdown();
     ASSERT_EQ_INT(1, buf_order_ok);
     ASSERT_EQ_INT(8, buf_recv_count);
-    ASSERT_EQ_INT(0, buf_send_blocked_at);  /* buffer filled before any recv */
+    if (st_workers() <= 1) {
+        /* Single scheduler: the producer fills the buffer before the
+         * consumer ever runs. With parallel workers the consumer may
+         * legally drain concurrently, so only FIFO order is asserted. */
+        ASSERT_EQ_INT(0, buf_send_blocked_at);
+    }
     return 0;
 }
 
@@ -1850,6 +1855,238 @@ static int test_mw_shutdown_busy(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test 42: serial queue runs tasks in strict submission order               */
+/* -------------------------------------------------------------------------- */
+#define Q_SERIAL_N 32
+static _Atomic int q_order_idx = 0;
+static int q_order_log[Q_SERIAL_N];
+
+static void q_order_task(void *arg) {
+    int slot = atomic_fetch_add(&q_order_idx, 1);
+    if (slot < Q_SERIAL_N) q_order_log[slot] = (int)(intptr_t)arg;
+    suspenders_yield();   /* give reordering every chance to happen */
+}
+
+static void q_serial_cr(void *arg) {
+    (void)arg;
+    suspenders_queue_t *q = suspenders_queue_create("serial", SUSPENDERS_QOS_NORMAL, 1);
+    if (!q) return;
+    for (int i = 0; i < Q_SERIAL_N; i++)
+        suspenders_queue_async(q, q_order_task, (void*)(intptr_t)i);
+    suspenders_queue_destroy(q);   /* waits for the drain */
+}
+
+static int test_queue_serial_order(void) {
+    q_order_idx = 0;
+    memset(q_order_log, -1, sizeof(q_order_log));
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(q_serial_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(Q_SERIAL_N, q_order_idx);
+    for (int i = 0; i < Q_SERIAL_N; i++) ASSERT_EQ_INT(i, q_order_log[i]);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 43: concurrent queue overlaps tasks                                   */
+/* -------------------------------------------------------------------------- */
+static _Atomic int q_conc_running = 0;
+static _Atomic int q_conc_peak = 0;
+static _Atomic int q_conc_done = 0;
+
+static void q_conc_task(void *arg) {
+    (void)arg;
+    int now = atomic_fetch_add(&q_conc_running, 1) + 1;
+    int peak = atomic_load(&q_conc_peak);
+    while (now > peak &&
+           !atomic_compare_exchange_weak(&q_conc_peak, &peak, now)) {}
+    suspenders_sleep_ns(5 * 1000000ULL);   /* 5ms: force overlap */
+    atomic_fetch_sub(&q_conc_running, 1);
+    atomic_fetch_add(&q_conc_done, 1);
+}
+
+static void q_conc_cr(void *arg) {
+    (void)arg;
+    suspenders_queue_t *q = suspenders_queue_create("conc", SUSPENDERS_QOS_NORMAL, 4);
+    if (!q) return;
+    for (int i = 0; i < 12; i++)
+        suspenders_queue_async(q, q_conc_task, NULL);
+    suspenders_queue_destroy(q);
+}
+
+static int test_queue_concurrent(void) {
+    q_conc_running = 0; q_conc_peak = 0; q_conc_done = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(q_conc_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(12, q_conc_done);
+    /* Drainers sleep concurrently even on one scheduler worker (they are
+     * separate coroutines), so overlap must appear regardless. */
+    ASSERT_TRUE(q_conc_peak >= 2);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 44: barrier runs alone, after earlier tasks, before later ones        */
+/* -------------------------------------------------------------------------- */
+static _Atomic int qb_pre_done = 0;
+static _Atomic int qb_running = 0;
+static _Atomic int qb_barrier_ok = -1;
+static _Atomic int qb_barrier_done = 0;
+static _Atomic int qb_post_early = 0;
+static _Atomic int qb_post_done = 0;
+
+static void qb_pre_task(void *arg) {
+    (void)arg;
+    atomic_fetch_add(&qb_running, 1);
+    suspenders_sleep_ns(2 * 1000000ULL);
+    atomic_fetch_sub(&qb_running, 1);
+    atomic_fetch_add(&qb_pre_done, 1);
+}
+
+static void qb_barrier_task(void *arg) {
+    (void)arg;
+    /* Alone: nothing running, every earlier task complete. */
+    atomic_store(&qb_barrier_ok,
+                 (atomic_load(&qb_running) == 0 &&
+                  atomic_load(&qb_pre_done) == 8) ? 1 : 0);
+    suspenders_sleep_ns(2 * 1000000ULL);
+    atomic_store(&qb_barrier_done, 1);
+}
+
+static void qb_post_task(void *arg) {
+    (void)arg;
+    if (!atomic_load(&qb_barrier_done)) atomic_fetch_add(&qb_post_early, 1);
+    atomic_fetch_add(&qb_post_done, 1);
+}
+
+static void qb_cr(void *arg) {
+    (void)arg;
+    suspenders_queue_t *q = suspenders_queue_create("barrier", SUSPENDERS_QOS_NORMAL, 4);
+    if (!q) return;
+    for (int i = 0; i < 8; i++) suspenders_queue_async(q, qb_pre_task, NULL);
+    suspenders_queue_barrier_async(q, qb_barrier_task, NULL);
+    for (int i = 0; i < 8; i++) suspenders_queue_async(q, qb_post_task, NULL);
+    suspenders_queue_destroy(q);
+}
+
+static int test_queue_barrier(void) {
+    qb_pre_done = 0; qb_running = 0; qb_barrier_ok = -1;
+    qb_barrier_done = 0; qb_post_early = 0; qb_post_done = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(qb_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(8, qb_pre_done);
+    ASSERT_EQ_INT(1, qb_barrier_ok);
+    ASSERT_EQ_INT(0, qb_post_early);
+    ASSERT_EQ_INT(8, qb_post_done);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 45: queue_sync completes before returning; queue_after fires on time  */
+/* -------------------------------------------------------------------------- */
+static _Atomic int q_sync_val = 0;
+static _Atomic int q_after_fired = 0;
+static _Atomic int q_after_early = 0;
+static uint64_t q_after_armed_ns = 0;
+
+static void q_sync_task(void *arg) {
+    suspenders_sleep_ns(2 * 1000000ULL);
+    atomic_store((_Atomic int*)arg, 77);
+}
+
+static void q_after_task(void *arg) {
+    (void)arg;
+    if (suspenders_now_ns() - q_after_armed_ns < 10 * 1000000ULL)
+        atomic_store(&q_after_early, 1);
+    atomic_store(&q_after_fired, 1);
+}
+
+static void q_sync_cr(void *arg) {
+    (void)arg;
+    suspenders_queue_t *q = suspenders_queue_create("sync", SUSPENDERS_QOS_NORMAL, 2);
+    if (!q) return;
+    q_after_armed_ns = suspenders_now_ns();
+    suspenders_queue_after(q, 10 * 1000000ULL /* 10ms */, q_after_task, NULL);
+    if (suspenders_queue_sync(q, q_sync_task, (void*)&q_sync_val) != SUSPENDERS_OK) {
+        suspenders_queue_destroy(q);
+        return;
+    }
+    /* sync returned: the task body must have completed */
+    if (atomic_load(&q_sync_val) != 77) atomic_store(&q_sync_val, -1);
+    while (!atomic_load(&q_after_fired)) suspenders_sleep_ns(1000000ULL);
+    suspenders_queue_destroy(q);
+}
+
+static int test_queue_sync_after(void) {
+    q_sync_val = 0; q_after_fired = 0; q_after_early = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(q_sync_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(77, q_sync_val);
+    ASSERT_EQ_INT(1, q_after_fired);
+    ASSERT_EQ_INT(0, q_after_early);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 46: destroy with pending tasks drains them; global queues just work   */
+/* -------------------------------------------------------------------------- */
+static _Atomic int q_drain_done = 0;
+static _Atomic int q_global_done = 0;
+
+static void q_drain_task(void *arg) {
+    (void)arg;
+    suspenders_yield();
+    atomic_fetch_add(&q_drain_done, 1);
+}
+
+static void q_global_task(void *arg) {
+    (void)arg;
+    atomic_fetch_add(&q_global_done, 1);
+}
+
+static void q_destroy_cr(void *arg) {
+    (void)arg;
+    suspenders_queue_t *q = suspenders_queue_create("drain", SUSPENDERS_QOS_NORMAL, 2);
+    if (!q) return;
+    for (int i = 0; i < 50; i++)
+        suspenders_queue_async(q, q_drain_task, NULL);
+    suspenders_queue_destroy(q);   /* immediately: all 50 must still run */
+
+    suspenders_queue_t *g1 = suspenders_get_global_queue(SUSPENDERS_QOS_NORMAL);
+    suspenders_queue_t *g2 = suspenders_get_global_queue(SUSPENDERS_QOS_NORMAL);
+    if (g1 != g2 || !g1) return;   /* same shared instance required */
+    for (int i = 0; i < 10; i++)
+        suspenders_queue_async(g1, q_global_task, NULL);
+    /* never destroyed: suspenders_shutdown reclaims global queues */
+}
+
+static int test_queue_destroy_global(void) {
+    q_drain_done = 0; q_global_done = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(q_destroy_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(50, q_drain_done);
+    ASSERT_EQ_INT(10, q_global_done);
+    /* Re-init after global-queue teardown must start clean. */
+    q_drain_done = 0; q_global_done = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(q_destroy_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(50, q_drain_done);
+    ASSERT_EQ_INT(10, q_global_done);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 static const st_test_t st_tests[] = {
@@ -1895,6 +2132,11 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_mw_mutex),
     ST_TEST(test_mw_select),
     ST_TEST(test_mw_shutdown_busy),
+    ST_TEST(test_queue_serial_order),
+    ST_TEST(test_queue_concurrent),
+    ST_TEST(test_queue_barrier),
+    ST_TEST(test_queue_sync_after),
+    ST_TEST(test_queue_destroy_global),
 };
 
 int main(int argc, char **argv) {

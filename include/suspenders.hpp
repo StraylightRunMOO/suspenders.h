@@ -544,63 +544,103 @@ public:
 };
 
 // ============================================================================
-// Dispatch Queue (serial task queue)
+// Task Queue (libdispatch-style; concurrency 1 = serial)
 // ============================================================================
 
-class DispatchQueue {
-    suspenders_dispatch_queue_t* q_ = nullptr;
-    
+class Queue {
+    suspenders_queue_t* q_ = nullptr;
+    bool owned_ = false;
+
     static void trampoline(void* arg) {
         auto* cb = static_cast<std::function<void()>*>(arg);
         (*cb)();
         delete cb;
     }
-    
+
+    explicit Queue(suspenders_queue_t* q, bool owned) : q_(q), owned_(owned) {}
+
 public:
-    DispatchQueue() = default;
-    
-    explicit DispatchQueue(const char* label, QoS qos = QoS::Normal) {
-        q_ = suspenders_dispatch_queue_create(label, static_cast<suspenders_qos_t>(qos));
-        if (!q_) throw std::runtime_error("suspenders::DispatchQueue: failed to create queue");
+    Queue() = default;
+
+    explicit Queue(const char* label, QoS qos = QoS::Normal, unsigned concurrency = 1)
+        : q_(suspenders_queue_create(label, static_cast<suspenders_qos_t>(qos), concurrency)),
+          owned_(true)
+    {
+        if (!q_) throw std::runtime_error("suspenders::Queue: failed to create queue");
     }
-    
-    ~DispatchQueue() {
-        if (q_) suspenders_dispatch_queue_destroy(q_);
+
+    // Non-owning handle to a shared global queue (freed at shutdown).
+    static Queue global(QoS qos = QoS::Normal) {
+        return Queue(suspenders_get_global_queue(static_cast<suspenders_qos_t>(qos)), false);
     }
-    
-    DispatchQueue(DispatchQueue&& other) noexcept : q_(other.q_) {
+
+    ~Queue() {
+        if (q_ && owned_) suspenders_queue_destroy(q_);
+    }
+
+    Queue(Queue&& other) noexcept : q_(other.q_), owned_(other.owned_) {
         other.q_ = nullptr;
+        other.owned_ = false;
     }
-    
-    DispatchQueue& operator=(DispatchQueue&& other) noexcept {
+
+    Queue& operator=(Queue&& other) noexcept {
         if (this != &other) {
-            if (q_) suspenders_dispatch_queue_destroy(q_);
+            if (q_ && owned_) suspenders_queue_destroy(q_);
             q_ = other.q_;
+            owned_ = other.owned_;
             other.q_ = nullptr;
+            other.owned_ = false;
         }
         return *this;
     }
-    
-    DispatchQueue(const DispatchQueue&) = delete;
-    DispatchQueue& operator=(const DispatchQueue&) = delete;
-    
+
+    Queue(const Queue&) = delete;
+    Queue& operator=(const Queue&) = delete;
+
     template<typename F>
-    void async(F&& f) {
-        if (!q_) return;
+    int async(F&& f) {
+        if (!q_) return SUSPENDERS_INVAL;
         auto* ptr = new std::function<void()>(std::forward<F>(f));
-        suspenders_dispatch_async(q_, trampoline, ptr);
+        int st = suspenders_queue_async(q_, trampoline, ptr);
+        if (st != SUSPENDERS_OK) delete ptr;
+        return st;
     }
-    
+
     template<typename F>
-    void barrier_async(F&& f) {
-        if (!q_) return;
-        auto* ptr = new std::function<void()>(std::forward<F>(f));
-        suspenders_dispatch_barrier_async(q_, trampoline, ptr);
+    int sync(F&& f) {
+        if (!q_) return SUSPENDERS_INVAL;
+        std::function<void()> fn(std::forward<F>(f));
+        return suspenders_queue_sync(q_, [](void* a) {
+            (*static_cast<std::function<void()>*>(a))();
+        }, &fn);
     }
-    
+
+    template<typename F>
+    int after(uint64_t delay_ns, F&& f) {
+        if (!q_) return SUSPENDERS_INVAL;
+        auto* ptr = new std::function<void()>(std::forward<F>(f));
+        int st = suspenders_queue_after(q_, delay_ns, trampoline, ptr);
+        if (st != SUSPENDERS_OK) delete ptr;
+        return st;
+    }
+
+    template<typename F>
+    int barrier_async(F&& f) {
+        if (!q_) return SUSPENDERS_INVAL;
+        auto* ptr = new std::function<void()>(std::forward<F>(f));
+        int st = suspenders_queue_barrier_async(q_, trampoline, ptr);
+        if (st != SUSPENDERS_OK) delete ptr;
+        return st;
+    }
+
+    [[nodiscard]] const char* label() const { return suspenders_queue_label(q_); }
     [[nodiscard]] bool valid() const { return q_ != nullptr; }
     explicit operator bool() const { return valid(); }
+    [[nodiscard]] suspenders_queue_t* native() const { return q_; }
 };
+
+// Deprecated alias from the pre-1.0 dispatch API.
+using DispatchQueue = Queue;
 
 // ============================================================================
 // Coroutine Pool (N workers consuming a shared task channel)
