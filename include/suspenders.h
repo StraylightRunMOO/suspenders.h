@@ -361,6 +361,8 @@ typedef struct suspenders_cr_s {
     uint64_t         id;
     char             name[32];
     size_t           stack_size;
+    unsigned         valgrind_stack_id;  /* used only under SUSPENDERS_VALGRIND;
+                                          * unconditional so layout never varies */
     /* Cancellation, deadline, cleanup */
     suspenders_atomic_int cancel_requested;
     suspenders_cleanup_t *cleanup_head;
@@ -562,11 +564,26 @@ struct suspenders_hose_s {
 extern SUSPENDERS_TLS int suspenders_errno;
 const char *suspenders_strerror(int err);
 
-/* Returns SUSPENDERS_OK or a negative error code (never aborts). */
+/* Runtime lifecycle. init starts `num_workers` scheduler workers (0 => 1);
+ * the thread that calls suspenders_run becomes worker 0 and the remaining
+ * workers run on their own threads. queue_hint sizes the io_uring SQ (0 =>
+ * 256). run returns once every coroutine has finished and no queue work or
+ * timer is pending; it may be called again after spawning more work.
+ * shutdown stops and joins the helpers, reclaims still-parked coroutines
+ * and queues, and resets the runtime for a clean re-init — call it from
+ * the same thread that called init, after run has returned (or without
+ * run, to abandon work). Returns SUSPENDERS_OK or an error (never aborts). */
 int  suspenders_init(unsigned num_workers, unsigned queue_hint);
 void suspenders_run(void);
 void suspenders_shutdown(void);
 
+/* Coroutine lifecycle. spawn creates a coroutine (any thread; foreign
+ * spawns go through the global injector) that pins to the first worker
+ * that runs it. yield reschedules; suspend parks until resume — both are
+ * coroutine-context only. resume is safe from any worker (cross-worker
+ * wakes route through the owner's inbox) and is a no-op for a coroutine
+ * that isn't parked. boost raises effective QoS (priority inheritance;
+ * reverts when the coroutine next completes a wait). */
 suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos_t qos);
 suspenders_cr_t* suspenders_go(void (*func)(void*), void *arg);  /* spawn at NORMAL */
 void suspenders_yield(void);
@@ -768,6 +785,12 @@ void  suspenders_hose_close(suspenders_hose_t *d);
     #include <liburing.h>
 #endif
 
+/* Opt-in: tell Valgrind about coroutine stacks so memcheck can follow the
+ * context switches (define SUSPENDERS_VALGRIND in the implementation TU). */
+#ifdef SUSPENDERS_VALGRIND
+    #include <valgrind/valgrind.h>
+#endif
+
 #ifndef SUSPENDERS_PLATFORM_WINDOWS
     #include <pthread.h>
 #endif
@@ -852,6 +875,11 @@ typedef struct suspenders_worker_s {
 #endif
     void *wake_op;                       /* io_uring: this worker's wake sentinel op */
 } suspenders_worker_t;
+
+/* One cacheline per worker: adjacent workers must not share a line, or the
+ * cross-thread inbox/parked writes would false-share with the neighbor. */
+SUSPENDERS_STATIC_ASSERT(sizeof(suspenders_worker_t) % SUSPENDERS_CACHELINE == 0,
+                         "suspenders_worker_t must be a whole number of cachelines");
 
 static suspenders_worker_t *s_workers = NULL;
 static unsigned s_num_workers = 0;
@@ -938,6 +966,14 @@ static void s_worker_signal(suspenders_worker_t *w) {
 static inline suspenders_worker_t* s_cr_worker(suspenders_cr_t *cr) {
     return (suspenders_worker_t*)suspenders_atomic_load(cr->worker,
                                                         SUSPENDERS_MEMORY_ORDER_SEQ_CST);
+}
+
+/* Relaxed variant for deciders: a granter observed the waiter's park under
+ * the structure's ticket lock, and the waiter pinned before parking, so the
+ * pin is already ordered before this load — no fence needed (hot path). */
+static inline suspenders_worker_t* s_cr_worker_rlx(suspenders_cr_t *cr) {
+    return (suspenders_worker_t*)suspenders_atomic_load(cr->worker,
+                                                        SUSPENDERS_MEMORY_ORDER_RELAXED);
 }
 
 static void s_inbox_wake(suspenders_cr_t *cr) {
@@ -1621,7 +1657,7 @@ void suspenders_resume(suspenders_cr_t *cr) {
  * suspenders_resume is off-limits under a spin lock. */
 static void s_wake_no_preempt(suspenders_cr_t *cr) {
     if (SUSPENDERS_UNLIKELY(!cr)) return;
-    suspenders_worker_t *w = s_cr_worker(cr);
+    suspenders_worker_t *w = s_cr_worker_rlx(cr);   /* decider: see helper */
     if (SUSPENDERS_UNLIKELY(w && w != s_worker)) {
         s_inbox_wake(cr);
         return;
@@ -1638,7 +1674,7 @@ static void s_wake_no_preempt(suspenders_cr_t *cr) {
  * this (lower-priority) granter of the chance to clear the flag. */
 static void s_wait_finish_wake(suspenders_wq_node_t *n) {
     suspenders_cr_t *cr = n->cr;
-    bool local = (s_cr_worker(cr) == s_worker);
+    bool local = (s_cr_worker_rlx(cr) == s_worker);   /* decider: see helper */
     int qos = suspenders_atomic_load(cr->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
     s_wake_no_preempt(cr);
     s_wait_decide_end(n);
@@ -1835,6 +1871,10 @@ static suspenders_cr_t* s_spawn_impl(void (*func)(void*), void *arg,
     cr->arena = arena;
     cr->owner_heap = heap;
     cr->stack_size = SUSPENDERS_STACK_SIZE;
+#ifdef SUSPENDERS_VALGRIND
+    cr->valgrind_stack_id = VALGRIND_STACK_REGISTER(
+        stack, (char*)stack + SUSPENDERS_STACK_SIZE);
+#endif
     cr->id = (uint64_t)suspenders_atomic_fetch_add(suspenders_next_id, 1,
                                                    SUSPENDERS_MEMORY_ORDER_RELAXED);
     cr->state = SUSPENDERS_STATE_READY;
@@ -2804,7 +2844,18 @@ static suspenders_backend_t* s_backend_create(unsigned hint) {
     if (!be) return NULL;
     memset(be, 0, sizeof(*be));
     be->type = SUSPENDERS_BE_IOURING;
-    int ret = io_uring_queue_init(hint, &be->ring, 0);
+    unsigned flags = 0;
+#ifdef SUSPENDERS_IOURING_SQPOLL
+    /* Experiment, default off: a kernel polling thread per ring eliminates
+     * submit syscalls but burns a core per worker — measured slower on
+     * small-core boards (see benchmarks). Requires a recent kernel or
+     * CAP_SYS_NICE. Falls back to a plain ring if setup fails. */
+    flags |= IORING_SETUP_SQPOLL;
+#endif
+    int ret = io_uring_queue_init(hint, &be->ring, flags);
+#ifdef SUSPENDERS_IOURING_SQPOLL
+    if (ret < 0) ret = io_uring_queue_init(hint, &be->ring, 0);
+#endif
     if (ret < 0) {
         free(be);
         return NULL;
@@ -4605,6 +4656,17 @@ void suspenders_pool_submit(suspenders_pool_t *pool,
 /* ============================================================================
  * SCHEDULER INITIALIZATION & LIFECYCLE
  * ============================================================================ */
+/* Destroy a coroutine's stack arena (the cr_t lives inside it). The arena is
+ * stamped with its creating heap, so this is foreign-safe when the spawner
+ * ran on another thread. */
+static void s_cr_arena_destroy(suspenders_cr_t *cr) {
+    if (!cr->arena) return;
+#ifdef SUSPENDERS_VALGRIND
+    VALGRIND_STACK_DEREGISTER(cr->valgrind_stack_id);
+#endif
+    memento_arena_destroy(cr->arena);
+}
+
 /* Reap this worker's finished coroutines (plain TLS list; crs are pinned). */
 static void s_zombie_reap(void) {
     while (s_zombies) {
@@ -4615,11 +4677,8 @@ static void s_zombie_reap(void) {
             DeleteFiber(zombie->ctx.fiber);
         }
 #endif
-        /* The cr_t lives inside its arena; destroying it frees both. The
-         * arena is stamped with its creating heap, so this is foreign-safe
-         * when the spawner ran on another thread. */
-        memento_arena_t *arena = zombie->arena;
-        if (arena) memento_arena_destroy(arena);
+        /* Destroying the arena frees the cr_t and its stack together. */
+        s_cr_arena_destroy(zombie);
     }
 }
 
@@ -4637,7 +4696,7 @@ static void s_live_reap(void) {
             DeleteFiber(cr->ctx.fiber);
         }
 #endif
-        if (cr->arena) memento_arena_destroy(cr->arena);
+        s_cr_arena_destroy(cr);
     }
 }
 
@@ -5018,7 +5077,7 @@ void suspenders_shutdown(void) {
         while (s_injector_heads[q]) {
             suspenders_cr_t *cr = s_injector_heads[q];
             s_injector_heads[q] = cr->next;
-            if (cr->arena) memento_arena_destroy(cr->arena);
+            s_cr_arena_destroy(cr);
         }
         s_injector_tails[q] = NULL;
     }

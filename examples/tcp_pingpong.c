@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 #define MEMENTO_IMPLEMENTATION
@@ -33,9 +34,9 @@
 #define NUM_CLIENTS 4
 #define NUM_PINGS 1000
 
-static volatile int running = 1;
-static volatile int total_pongs = 0;
-static volatile int clients_done = 0;
+static _Atomic int running = 1;
+static _Atomic int total_pongs = 0;
+static _Atomic int clients_done = 0;
 static suspenders_cr_t *server_cr = NULL;
 
 void signal_handler(int sig) {
@@ -148,7 +149,7 @@ void client_worker(void *arg) {
         
         if (strncmp(recv_buf, "PONG", 4) == 0) {
             pongs_received++;
-            __atomic_fetch_add(&total_pongs, 1, __ATOMIC_RELAXED);
+            atomic_fetch_add(&total_pongs, 1);
         }
     }
     
@@ -157,7 +158,7 @@ void client_worker(void *arg) {
     suspenders_hose_close(&conn);
 
     /* Signal shutdown when all clients are done */
-    if (__atomic_add_fetch(&clients_done, 1, __ATOMIC_RELAXED) == NUM_CLIENTS) {
+    if (atomic_fetch_add(&clients_done, 1) + 1 == NUM_CLIENTS) {
         running = 0;
         /* Cancel the server's pending accept operation */
         suspenders_cancel(server_cr);

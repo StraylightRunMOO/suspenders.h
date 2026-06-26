@@ -133,6 +133,9 @@ target_compile_options(suspenders-bench-channels PRIVATE -O3)
 add_suspenders_executable(suspenders-bench-hose benchmarks/benchmark_hose.c)
 target_compile_options(suspenders-bench-hose PRIVATE -O3)
 
+add_suspenders_executable(suspenders-bench-cycles benchmarks/benchmark_cycles.c)
+target_compile_options(suspenders-bench-cycles PRIVATE -O3)
+
 # C examples
 foreach(example tcp_pingpong tcp_echo udp_echo unix_echo channel_demo
                 suspend_resume_demo thread_pool dispatch_demo event_loop)
