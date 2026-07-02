@@ -28,7 +28,7 @@ void producer(void *arg) {
     int id = (int)(intptr_t)arg;
     for (int i = 0; i < ITEMS_PER_PRODUCER; i++) {
         int val = id * 1000000 + i;
-        if (!suspenders_chan_send(channel, &val)) {
+        if (suspenders_chan_send(channel, &val) != SUSPENDERS_OK) {
             fprintf(stderr, "Producer %d: send failed at item %d\n", id, i);
             return;
         }
@@ -44,7 +44,7 @@ void consumer(void *arg) {
 
     for (int i = 0; i < expected; i++) {
         int val = 0;
-        if (!suspenders_chan_recv(channel, &val)) {
+        if (suspenders_chan_recv(channel, &val) != SUSPENDERS_OK) {
             fprintf(stderr, "Consumer: recv failed at item %d\n", i);
             break;
         }
