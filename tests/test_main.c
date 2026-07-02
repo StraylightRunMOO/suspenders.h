@@ -485,6 +485,111 @@ static int test_hose_dial_failure(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test 15: Hose used by coroutine other than creator                         */
+/* -------------------------------------------------------------------------- */
+#define CROSS_OWNER_PORT 54322
+
+static volatile int cross_owner_server_ready = 0;
+static volatile int cross_owner_hose_ready = 0;
+static hose_t *volatile cross_owner_conn = NULL;
+static volatile int cross_owner_pass = 0;
+
+void cross_owner_user(void *arg);
+
+void cross_owner_server(void *arg) {
+    (void)arg;
+    hose_t listener;
+    hose_init(&listener, NULL);
+
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CROSS_OWNER_PORT);
+    if (!hose_listen(&listener, uri)) return;
+
+    cross_owner_server_ready = 1;
+
+    hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+    if (!client) { hose_close(&listener); return; }
+
+    if (!hose_accept(&listener, client)) {
+        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+        hose_close(&listener);
+        return;
+    }
+
+    /* Yield to let the client block on I/O before we echo back. */
+    suspenders_yield();
+
+    char buf[64];
+    ssize_t n = hose_read(client, buf, sizeof(buf));
+    if (n > 0) {
+        hose_write(client, buf, n);
+    }
+
+    hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+    hose_close(&listener);
+}
+
+void cross_owner_creator(void *arg) {
+    (void)arg;
+    /* Wait for server */
+    while (!cross_owner_server_ready)
+        suspenders_yield();
+
+    hose_t *conn = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
+    if (!conn) return;
+    hose_init(conn, NULL);
+
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", CROSS_OWNER_PORT);
+    if (!hose_dial(conn, uri)) {
+        memento_thread_heap_free(memento_thread_heap_get(), conn, sizeof(hose_t));
+        return;
+    }
+
+    cross_owner_conn = conn;
+    cross_owner_hose_ready = 1;
+
+    /* Spawn the user only after the hose is ready so it does not spin-wait. */
+    suspenders_spawn(cross_owner_user, NULL, SUSPENDERS_QOS_NORMAL);
+    /* Return without using the hose. The user coroutine will perform I/O. */
+}
+
+void cross_owner_user(void *arg) {
+    (void)arg;
+    if (!cross_owner_conn) return;
+
+    const char *msg = "CROSS OWNER";
+    if (hose_write(cross_owner_conn, msg, strlen(msg)) <= 0) {
+        hose_close(cross_owner_conn);
+        return;
+    }
+
+    char rbuf[64] = {0};
+    ssize_t n = hose_read(cross_owner_conn, rbuf, sizeof(rbuf) - 1);
+    if (n > 0 && strncmp(rbuf, msg, n) == 0)
+        cross_owner_pass = 1;
+
+    hose_close(cross_owner_conn);
+    memento_thread_heap_free(memento_thread_heap_get(), cross_owner_conn, sizeof(hose_t));
+}
+
+static int test_hose_cross_owner(void) {
+    cross_owner_pass = 0;
+    cross_owner_server_ready = 0;
+    cross_owner_hose_ready = 0;
+    cross_owner_conn = NULL;
+
+    suspenders_init(0, 256);
+    suspenders_spawn(cross_owner_server, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(cross_owner_creator, NULL, SUSPENDERS_QOS_NORMAL);
+    /* user is spawned by creator once the hose is ready */
+    suspenders_run();
+    suspenders_shutdown();
+    return cross_owner_pass ? 0 : 1;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 int main(void) {
@@ -504,6 +609,7 @@ int main(void) {
     RUN_TEST(test_reentrant_init);
     RUN_TEST(test_spawn_chain);
     RUN_TEST(test_hose_dial_failure);
+    RUN_TEST(test_hose_cross_owner);
 
     printf("\n=== Test Summary ===\n");
     printf("  Tests run:    %d\n", tests_run);
