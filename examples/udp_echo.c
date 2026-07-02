@@ -8,7 +8,9 @@
  *       -I../include -I../third_party $(pkg-config --cflags --libs liburing) -lpthread
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,12 +32,12 @@ static volatile int replies_ok = 0;
 
 void udp_server(void *arg) {
     (void)arg;
-    hose_t server;
-    hose_init(&server, NULL);
+    suspenders_hose_t server;
+    suspenders_hose_init(&server, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "udp://0.0.0.0:%d", SERVER_PORT);
-    if (!hose_listen(&server, uri)) {
+    if (!suspenders_hose_listen(&server, uri)) {
         fprintf(stderr, "[Server] Failed to bind %s\n", uri);
         return;
     }
@@ -47,7 +49,7 @@ void udp_server(void *arg) {
     socklen_t addr_len = sizeof(client_addr);
 
     while (running && replies_ok < NUM_MESSAGES) {
-        ssize_t n = hose_recvfrom(&server, buf, sizeof(buf) - 1,
+        ssize_t n = suspenders_hose_recvfrom(&server, buf, sizeof(buf) - 1,
                                   (struct sockaddr*)&client_addr, &addr_len);
         if (n < 0) {
             if (!running) break;
@@ -55,25 +57,25 @@ void udp_server(void *arg) {
         }
 
         /* Echo the datagram back to the sender */
-        ssize_t sent = hose_sendto(&server, buf, n,
+        ssize_t sent = suspenders_hose_sendto(&server, buf, n,
                                    (struct sockaddr*)&client_addr, addr_len);
         if (sent < 0) break;
     }
 
     printf("[Server] Shutting down\n");
-    hose_close(&server);
+    suspenders_hose_close(&server);
     server_done = 1;
 }
 
 void udp_client(void *arg) {
     (void)arg;
-    hose_t client;
+    suspenders_hose_t client;
     struct buf b = {0};
-    hose_init(&client, &b);
+    suspenders_hose_init(&client, &b);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "udp://127.0.0.1:%d", SERVER_PORT);
-    if (!hose_dial(&client, uri)) {
+    if (!suspenders_hose_dial(&client, uri)) {
         fprintf(stderr, "[Client] Failed to dial %s\n", uri);
         return;
     }
@@ -85,12 +87,12 @@ void udp_client(void *arg) {
 
     for (int i = 0; i < NUM_MESSAGES && running; i++) {
         snprintf(send_buf, sizeof(send_buf), "MSG %d", i);
-        if (hose_write(&client, send_buf, strlen(send_buf)) <= 0) {
+        if (suspenders_hose_write(&client, send_buf, strlen(send_buf)) <= 0) {
             fprintf(stderr, "[Client] Send failed at %d\n", i);
             break;
         }
 
-        ssize_t n = hose_read(&client, recv_buf, sizeof(recv_buf) - 1);
+        ssize_t n = suspenders_hose_read(&client, recv_buf, sizeof(recv_buf) - 1);
         if (n <= 0) {
             fprintf(stderr, "[Client] Recv failed at %d\n", i);
             break;
@@ -102,7 +104,7 @@ void udp_client(void *arg) {
     }
 
     printf("[Client] Received %d/%d valid replies\n", replies_ok, NUM_MESSAGES);
-    hose_close(&client);
+    suspenders_hose_close(&client);
     client_done = 1;
     running = 0;
 }

@@ -1,5 +1,7 @@
 /* bench_switch.c - Raw context switch micro-benchmark */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
@@ -21,7 +23,6 @@ static inline uint64_t read_monotonic_ns(void) {
 /* Two contexts for ping-pong - must be properly initialized */
 static suspenders_ctx_t ctx_a = {0};
 static suspenders_ctx_t ctx_b = {0};
-static volatile int switch_count = 0;
 
 int main(void) {
     memento_init();

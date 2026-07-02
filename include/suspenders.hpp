@@ -298,22 +298,22 @@ public:
 // ============================================================================
 
 class Hose {
-    hose_t hose_{};
+    suspenders_hose_t suspenders_hose_{};
     bool valid_ = false;
     
 public:
     Hose() {
-        hose_init(&hose_, nullptr);
+        suspenders_hose_init(&suspenders_hose_, nullptr);
         valid_ = true;
     }
     
     explicit Hose(struct buf* buffer) : Hose() {
-        hose_.buffer = buffer;
+        suspenders_hose_.buffer = buffer;
     }
     
     ~Hose() {
         if (valid_) {
-            hose_close(&hose_);
+            suspenders_hose_close(&suspenders_hose_);
         }
     }
     
@@ -322,19 +322,19 @@ public:
     Hose& operator=(const Hose&) = delete;
     
     Hose(Hose&& other) noexcept 
-        : hose_(other.hose_), valid_(other.valid_) 
+        : suspenders_hose_(other.suspenders_hose_), valid_(other.valid_) 
     {
         other.valid_ = false;
-        other.hose_.fd = SUSPENDERS_INVALID_SOCK;
+        other.suspenders_hose_.fd = SUSPENDERS_INVALID_SOCK;
     }
     
     Hose& operator=(Hose&& other) noexcept {
         if (this != &other) {
-            if (valid_) hose_close(&hose_);
-            hose_ = other.hose_;
+            if (valid_) suspenders_hose_close(&suspenders_hose_);
+            suspenders_hose_ = other.suspenders_hose_;
             valid_ = other.valid_;
             other.valid_ = false;
-            other.hose_.fd = SUSPENDERS_INVALID_SOCK;
+            other.suspenders_hose_.fd = SUSPENDERS_INVALID_SOCK;
         }
         return *this;
     }
@@ -342,20 +342,20 @@ public:
     // Connection setup
     [[nodiscard]] bool dial(std::string_view uri) {
         if (!valid_) return false;
-        return hose_dial(&hose_, std::string(uri).c_str());
+        return suspenders_hose_dial(&suspenders_hose_, std::string(uri).c_str());
     }
     
     [[nodiscard]] bool listen(std::string_view uri) {
         if (!valid_) return false;
-        return hose_listen(&hose_, std::string(uri).c_str());
+        return suspenders_hose_listen(&suspenders_hose_, std::string(uri).c_str());
     }
     
     [[nodiscard]] bool accept(Hose& client) {
         if (!valid_) return false;
-        hose_t client_hose;
-        if (hose_accept(&hose_, &client_hose)) {
+        suspenders_hose_t client_hose;
+        if (suspenders_hose_accept(&suspenders_hose_, &client_hose)) {
             client.close();
-            client.hose_ = client_hose;
+            client.suspenders_hose_ = client_hose;
             client.valid_ = true;
             return true;
         }
@@ -365,22 +365,22 @@ public:
     // I/O operations
     [[nodiscard]] ssize_t read(void* dest, size_t len) {
         if (!valid_) return -1;
-        return hose_read(&hose_, dest, len);
+        return suspenders_hose_read(&suspenders_hose_, dest, len);
     }
     
     [[nodiscard]] ssize_t write(const void* src, size_t len) {
         if (!valid_) return -1;
-        return hose_write(&hose_, src, len);
+        return suspenders_hose_write(&suspenders_hose_, src, len);
     }
     
     [[nodiscard]] ssize_t recvfrom(void* dest, size_t len, struct sockaddr* addr, socklen_t* addrlen) {
         if (!valid_) return -1;
-        return hose_recvfrom(&hose_, dest, len, addr, addrlen);
+        return suspenders_hose_recvfrom(&suspenders_hose_, dest, len, addr, addrlen);
     }
     
     [[nodiscard]] ssize_t sendto(const void* src, size_t len, const struct sockaddr* addr, socklen_t addrlen) {
         if (!valid_) return -1;
-        return hose_sendto(&hose_, src, len, addr, addrlen);
+        return suspenders_hose_sendto(&suspenders_hose_, src, len, addr, addrlen);
     }
     
     template<typename T>
@@ -395,14 +395,14 @@ public:
     
     void close() {
         if (valid_) {
-            hose_close(&hose_);
+            suspenders_hose_close(&suspenders_hose_);
             valid_ = false;
         }
     }
     
-    [[nodiscard]] suspenders_sock_t fd() const { return hose_.fd; }
-    [[nodiscard]] bool valid() const { return valid_ && hose_.fd != SUSPENDERS_INVALID_SOCK; }
-    [[nodiscard]] hose_t* native() { return &hose_; }
+    [[nodiscard]] suspenders_sock_t fd() const { return suspenders_hose_.fd; }
+    [[nodiscard]] bool valid() const { return valid_ && suspenders_hose_.fd != SUSPENDERS_INVALID_SOCK; }
+    [[nodiscard]] suspenders_hose_t* native() { return &suspenders_hose_; }
 };
 
 // ============================================================================
@@ -641,7 +641,7 @@ void coroutine_trampoline(void* arg) {
 } // namespace detail
 
 template<typename F>
-[[nodiscard]] Task spawn(F&& f, QoS qos = QoS::Normal) {
+Task spawn(F&& f, QoS qos = QoS::Normal) {
     using Func = std::decay_t<F>;
     auto* ptr = new Func(std::forward<F>(f));
     
@@ -655,7 +655,7 @@ template<typename F>
 }
 
 // Convenience for void(*)(void*) functions (no allocation overhead)
-[[nodiscard]] inline Task spawn(void (*func)(void*), void* arg = nullptr, 
+inline Task spawn(void (*func)(void*), void* arg = nullptr, 
                                 QoS qos = QoS::Normal) {
     suspenders_cr_t* cr = suspenders_spawn(func, arg, static_cast<suspenders_qos_t>(qos));
     if (!cr) throw std::runtime_error("suspenders::spawn: failed to create coroutine");

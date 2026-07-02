@@ -13,7 +13,7 @@ static void handle_client(suspenders::Hose client) {
     char buf[256];
     ssize_t n;
     while ((n = client.read(buf, sizeof(buf))) > 0) {
-        client.write(buf, static_cast<size_t>(n));
+        if (client.write(buf, static_cast<size_t>(n)) < 0) break;
     }
 }
 

@@ -2,11 +2,49 @@
 #ifndef LIBSUSPENDERS_H
 #define LIBSUSPENDERS_H
 
+/* ============================================================================
+ * Version
+ * ============================================================================ */
+#define SUSPENDERS_VERSION_MAJOR 1
+#define SUSPENDERS_VERSION_MINOR 0
+#define SUSPENDERS_VERSION_PATCH 0
+#define SUSPENDERS_VERSION "1.0.0"
+#define SUSPENDERS_VERSION_NUMBER \
+    (SUSPENDERS_VERSION_MAJOR * 10000 + SUSPENDERS_VERSION_MINOR * 100 + SUSPENDERS_VERSION_PATCH)
+
+/* ============================================================================
+ * Language requirements - full C11 (or C++11) commitment
+ * ============================================================================ */
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L)
+    #error "suspenders.h requires C11: compile with -std=c11 (or later)"
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef __cplusplus
+    #define SUSPENDERS_TLS thread_local
+#else
+    #define SUSPENDERS_TLS _Thread_local
+#endif
+
+/* C11 alignment: applied to the first member of a struct so the whole
+ * struct inherits the alignment ( _Alignas is not valid on typedefs). */
+#ifdef __cplusplus
+    #define SUSPENDERS_ALIGNAS(x) alignas(x)
+    #define SUSPENDERS_RESTRICT __restrict
+    #define SUSPENDERS_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+    #define SUSPENDERS_ALIGNAS(x) _Alignas(x)
+    #define SUSPENDERS_RESTRICT restrict
+    #define SUSPENDERS_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+#define SUSPENDERS_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define SUSPENDERS_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SUSPENDERS_CACHELINE   64
 
 /* ============================================================================
  * Atomic abstraction - C11 _Atomic in C, std::atomic in C++
@@ -21,14 +59,19 @@ typedef std::atomic<uintptr_t>     suspenders_atomic_uintptr_t;
 #define SUSPENDERS_MEMORY_ORDER_RELAXED std::memory_order_relaxed
 #define SUSPENDERS_MEMORY_ORDER_ACQUIRE std::memory_order_acquire
 #define SUSPENDERS_MEMORY_ORDER_RELEASE std::memory_order_release
+#define SUSPENDERS_MEMORY_ORDER_ACQ_REL std::memory_order_acq_rel
+#define SUSPENDERS_MEMORY_ORDER_SEQ_CST std::memory_order_seq_cst
 
 #define suspenders_atomic_init(x, val)                 ((x) = (val))
 #define suspenders_atomic_load(x, order)               ((x).load(order))
 #define suspenders_atomic_store(x, val, order)         ((x).store((val), (order)))
 #define suspenders_atomic_fetch_add(x, val, order)     ((x).fetch_add((val), (order)))
 #define suspenders_atomic_fetch_sub(x, val, order)     ((x).fetch_sub((val), (order)))
-#define suspenders_atomic_compare_exchange_weak(x, expected, desired) \
-    ((x).compare_exchange_weak((expected), (desired)))
+#define suspenders_atomic_exchange(x, val, order)      ((x).exchange((val), (order)))
+#define suspenders_atomic_compare_exchange_weak(x, expected, desired, succ, fail) \
+    ((x).compare_exchange_weak((expected), (desired), (succ), (fail)))
+#define suspenders_atomic_compare_exchange_strong(x, expected, desired, succ, fail) \
+    ((x).compare_exchange_strong((expected), (desired), (succ), (fail)))
 #else
 #include <stdatomic.h>
 typedef _Atomic int                suspenders_atomic_int;
@@ -39,14 +82,19 @@ typedef _Atomic uintptr_t          suspenders_atomic_uintptr_t;
 #define SUSPENDERS_MEMORY_ORDER_RELAXED memory_order_relaxed
 #define SUSPENDERS_MEMORY_ORDER_ACQUIRE memory_order_acquire
 #define SUSPENDERS_MEMORY_ORDER_RELEASE memory_order_release
+#define SUSPENDERS_MEMORY_ORDER_ACQ_REL memory_order_acq_rel
+#define SUSPENDERS_MEMORY_ORDER_SEQ_CST memory_order_seq_cst
 
 #define suspenders_atomic_init(x, val)                 atomic_init(&(x), (val))
 #define suspenders_atomic_load(x, order)               atomic_load_explicit(&(x), (order))
 #define suspenders_atomic_store(x, val, order)         atomic_store_explicit(&(x), (val), (order))
 #define suspenders_atomic_fetch_add(x, val, order)     atomic_fetch_add_explicit(&(x), (val), (order))
 #define suspenders_atomic_fetch_sub(x, val, order)     atomic_fetch_sub_explicit(&(x), (val), (order))
-#define suspenders_atomic_compare_exchange_weak(x, expected, desired) \
-    atomic_compare_exchange_weak(&(x), &(expected), (desired))
+#define suspenders_atomic_exchange(x, val, order)      atomic_exchange_explicit(&(x), (val), (order))
+#define suspenders_atomic_compare_exchange_weak(x, expected, desired, succ, fail) \
+    atomic_compare_exchange_weak_explicit(&(x), &(expected), (desired), (succ), (fail))
+#define suspenders_atomic_compare_exchange_strong(x, expected, desired, succ, fail) \
+    atomic_compare_exchange_strong_explicit(&(x), &(expected), (desired), (succ), (fail))
 #endif
 
 /* ============================================================================
@@ -109,9 +157,9 @@ typedef _Atomic uintptr_t          suspenders_atomic_uintptr_t;
     #include <sys/un.h>
 #endif
 
-#if SUSPENDERS_BACKEND_IOURING
-    #include <liburing.h>
-#endif
+/* NOTE: liburing.h is only needed by the implementation and is included
+ * inside the SUSPENDERS_IMPLEMENTATION block. Consumers of this header do
+ * not need liburing headers on their include path. */
 
 /* ============================================================================
  * MEMENTO INTEGRATION
@@ -137,9 +185,9 @@ struct buf {
     size_t cap;
 };
 
-bool buf_append(struct buf *buf, const char *data, ssize_t len);
-bool buf_append_byte(struct buf *buf, char ch);
-void buf_clear(struct buf *buf);
+bool buf_append(struct buf *SUSPENDERS_RESTRICT buf, const char *SUSPENDERS_RESTRICT data, ssize_t len);
+bool buf_append_byte(struct buf *SUSPENDERS_RESTRICT buf, char ch);
+void buf_clear(struct buf *SUSPENDERS_RESTRICT buf);
 
 /* ============================================================================
  * SOCKET PORTABILITY
@@ -163,11 +211,26 @@ void buf_clear(struct buf *buf);
 /* ============================================================================
  * SUSPENDERS CORE - Ultra-fast stackful coroutines
  * ============================================================================ */
-#define SUSPENDERS_ALIGNAS(x) __attribute__((aligned(x)))
-#define SUSPENDERS_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define SUSPENDERS_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define SUSPENDERS_CACHELINE   64
 #define SUSPENDERS_STACK_SIZE  (1UL << 20)  /* 1MB default stack */
+
+/* ============================================================================
+ * ERROR CODES - returned by fallible APIs and mirrored in suspenders_errno
+ * ============================================================================ */
+enum {
+    SUSPENDERS_OK        = 0,    /* Success */
+    SUSPENDERS_ERROR     = -1,   /* System error (check errno) */
+    SUSPENDERS_INVAL     = -2,   /* Invalid argument */
+    SUSPENDERS_NOMEM     = -3,   /* Out of memory */
+    SUSPENDERS_TIMEDOUT  = -4,   /* Deadline expired */
+    SUSPENDERS_CANCELED  = -5,   /* Operation canceled */
+    SUSPENDERS_CLOSED    = -6,   /* Channel closed */
+    SUSPENDERS_EMPTY     = -7,   /* Channel empty (try_recv) */
+    SUSPENDERS_FULL      = -8,   /* Channel full (try_send) */
+    SUSPENDERS_BUSY      = -9,   /* Resource busy (trylock) */
+    SUSPENDERS_NOTINIT   = -10,  /* Runtime not initialized */
+    SUSPENDERS_NOTFOUND  = -11,  /* No such transport/resource */
+    SUSPENDERS_PERM      = -12   /* Operation not permitted in this context */
+};
 
 typedef enum {
     SUSPENDERS_QOS_REALTIME = 0,
@@ -187,22 +250,22 @@ typedef enum {
 /* Forward declarations */
 struct suspenders_cr_s;
 struct suspenders_backend_s;
-struct hose_s;
+struct suspenders_hose_s;
 
 /* Context structure - packed for minimal cache footprint */
 #if SUSPENDERS_PLATFORM_WINDOWS
 
 typedef struct {
-    void *fiber;
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) void *fiber;
     void (*func)(void*);
     void *arg;
     struct suspenders_cr_s *cr;
-} suspenders_ctx_t SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE);
+} suspenders_ctx_t;
 
 #elif defined(SUSPENDERS_ARCH_X86_64)
 
 typedef struct {
-    void *rip;
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) void *rip;
     void *rsp;
     void *rbp;
     void *rbx;
@@ -210,16 +273,16 @@ typedef struct {
     void *r13;
     void *r14;
     void *r15;
-} suspenders_ctx_t SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE);
+} suspenders_ctx_t;
 
 #elif defined(SUSPENDERS_ARCH_AARCH64)
 
 typedef struct {
-    void *x[12];   /* x19-x30 */
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) void *x[12];   /* x19-x30 */
     void *sp;
     void *lr;
     void *d[8];    /* d8-d15 (NEON/VFP callee-saved) */
-} suspenders_ctx_t SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE);
+} suspenders_ctx_t;
 
 #else
     #error "libsuspenders: only x86_64 and aarch64 supported"
@@ -232,9 +295,10 @@ typedef struct suspenders_wq_node_s {
     struct suspenders_wq_node_s *next;
 } suspenders_wq_node_t;
 
-/* Coroutine structure - cache line aligned */
+/* Coroutine structure - cache line aligned (the asm context switch requires
+ * ctx at offset 0; see static asserts below) */
 typedef struct suspenders_cr_s {
-    suspenders_ctx_t      ctx;
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_ctx_t ctx;
     suspenders_state_t    state;
     suspenders_atomic_int effective_qos;
     int              base_qos;
@@ -242,27 +306,63 @@ typedef struct suspenders_cr_s {
     suspenders_wq_node_t  wq_node;
     int32_t          io_result;   /* Result from last I/O op */
     struct suspenders_cr_s *next;      /* Ready queue linkage */
-} SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_cr_t;
+} suspenders_cr_t;
 
 /* Ticket lock - strict FIFO ordering */
 typedef struct {
-    suspenders_atomic_u32 next_ticket;
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_atomic_u32 next_ticket;
     suspenders_atomic_u32 now_serving;
-} SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) suspenders_ticket_lock_t;
+} suspenders_ticket_lock_t;
 
-static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l);
-static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l);
-static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l);
+static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l) {
+    suspenders_atomic_init(l->next_ticket, 0);
+    suspenders_atomic_init(l->now_serving, 0);
+}
+
+static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l) {
+    uint32_t my_ticket = suspenders_atomic_fetch_add(l->next_ticket, 1,
+                                                    SUSPENDERS_MEMORY_ORDER_RELAXED);
+    while (suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_ACQUIRE) != my_ticket) {
+#if defined(SUSPENDERS_ARCH_X86_64)
+        __builtin_ia32_pause();
+#elif defined(SUSPENDERS_ARCH_AARCH64)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
+}
+
+static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l) {
+    uint32_t current = suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_RELAXED);
+    suspenders_atomic_store(l->now_serving, current + 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
+}
 
 /* Channel - zero-copy rendezvous communication */
 typedef struct {
-    size_t elem_sz;
+    SUSPENDERS_ALIGNAS(SUSPENDERS_CACHELINE) size_t elem_sz;
     size_t buf_sz;
     suspenders_atomic_size_t count;
     suspenders_wq_node_t *senders;
     suspenders_wq_node_t *receivers;
     suspenders_ticket_lock_t lock;
 } suspenders_chan_t;
+
+/* Layout invariants the hand-rolled context switch depends on */
+SUSPENDERS_STATIC_ASSERT(offsetof(suspenders_cr_t, ctx) == 0,
+                         "asm context switch requires ctx at offset 0 of suspenders_cr_t");
+SUSPENDERS_STATIC_ASSERT(sizeof(suspenders_cr_t) % SUSPENDERS_CACHELINE == 0,
+                         "suspenders_cr_t must be a whole number of cache lines");
+SUSPENDERS_STATIC_ASSERT(sizeof(suspenders_ticket_lock_t) % SUSPENDERS_CACHELINE == 0,
+                         "suspenders_ticket_lock_t must be a whole number of cache lines");
+#if defined(SUSPENDERS_ARCH_X86_64) && !defined(SUSPENDERS_PLATFORM_WINDOWS)
+SUSPENDERS_STATIC_ASSERT(offsetof(suspenders_ctx_t, rsp) == 8 &&
+                         offsetof(suspenders_ctx_t, r15) == 56,
+                         "x86_64 asm uses fixed 8-byte slot offsets into suspenders_ctx_t");
+#elif defined(SUSPENDERS_ARCH_AARCH64) && !defined(SUSPENDERS_PLATFORM_WINDOWS)
+SUSPENDERS_STATIC_ASSERT(offsetof(suspenders_ctx_t, sp) == 96 &&
+                         offsetof(suspenders_ctx_t, lr) == 104 &&
+                         offsetof(suspenders_ctx_t, d) == 112,
+                         "aarch64 asm uses fixed stp/ldp pair offsets into suspenders_ctx_t");
+#endif
 
 /* ============================================================================
  * EVENT BACKEND
@@ -272,18 +372,18 @@ typedef struct suspenders_backend_s suspenders_backend_t;
 /* ============================================================================
  * TRANSPORT ABSTRACTION
  * ============================================================================ */
-typedef struct hose_s hose_t;
+typedef struct suspenders_hose_s suspenders_hose_t;
 
 typedef struct suspenders_transport_ops {
     const char *scheme;
-    bool (*dial)(hose_t *h, const char *host, int port);
-    bool (*listen)(hose_t *h, const char *host, int port);
-    bool (*accept)(hose_t *listener, hose_t *client);
-    ssize_t (*read)(hose_t *h, void *dest, size_t len);
-    ssize_t (*write)(hose_t *h, const void *src, size_t len);
-    ssize_t (*recvfrom)(hose_t *h, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen);
-    ssize_t (*sendto)(hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen);
-    void (*close)(hose_t *h);
+    bool (*dial)(suspenders_hose_t *h, const char *host, int port);
+    bool (*listen)(suspenders_hose_t *h, const char *host, int port);
+    bool (*accept)(suspenders_hose_t *listener, suspenders_hose_t *client);
+    ssize_t (*read)(suspenders_hose_t *h, void *dest, size_t len);
+    ssize_t (*write)(suspenders_hose_t *h, const void *src, size_t len);
+    ssize_t (*recvfrom)(suspenders_hose_t *h, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen);
+    ssize_t (*sendto)(suspenders_hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen);
+    void (*close)(suspenders_hose_t *h);
 } suspenders_transport_ops_t;
 
 #ifdef __cplusplus
@@ -296,24 +396,24 @@ const suspenders_transport_ops_t* suspenders_transport_find(const char *scheme);
 /* ============================================================================
  * HOSE - Async I/O abstraction
  * ============================================================================ */
-#define HOSE_ROLE_READER   (1 << 0)
-#define HOSE_ROLE_WRITER   (1 << 1)
-#define HOSE_ROLE_DIALER   (1 << 2)
-#define HOSE_ROLE_LISTENER (1 << 3)
+#define SUSPENDERS_HOSE_ROLE_READER   (1 << 0)
+#define SUSPENDERS_HOSE_ROLE_WRITER   (1 << 1)
+#define SUSPENDERS_HOSE_ROLE_DIALER   (1 << 2)
+#define SUSPENDERS_HOSE_ROLE_LISTENER (1 << 3)
 
 typedef enum {
-    HOSE_PROTO_UNKNOWN,
-    HOSE_PROTO_FILE,
-    HOSE_PROTO_TCP,
-    HOSE_PROTO_UDP,
-    HOSE_PROTO_UNIX,
-    HOSE_PROTO_PIPE,
-    HOSE_PROTO_TTY,
-} hose_protocol_t;
+    SUSPENDERS_HOSE_PROTO_UNKNOWN,
+    SUSPENDERS_HOSE_PROTO_FILE,
+    SUSPENDERS_HOSE_PROTO_TCP,
+    SUSPENDERS_HOSE_PROTO_UDP,
+    SUSPENDERS_HOSE_PROTO_UNIX,
+    SUSPENDERS_HOSE_PROTO_PIPE,
+    SUSPENDERS_HOSE_PROTO_TTY,
+} suspenders_hose_protocol_t;
 
-struct hose_s {
+struct suspenders_hose_s {
     uint8_t          roles;
-    hose_protocol_t  protocol;
+    suspenders_hose_protocol_t  protocol;
     suspenders_sock_t fd;
     struct buf      *buffer;
     const suspenders_transport_ops_t *transport;
@@ -323,7 +423,12 @@ struct hose_s {
  * PUBLIC API
  * ============================================================================ */
 
-void suspenders_init(unsigned num_workers, unsigned queue_hint);
+/* Thread-local detailed error of the most recent failing call */
+extern SUSPENDERS_TLS int suspenders_errno;
+const char *suspenders_strerror(int err);
+
+/* Returns SUSPENDERS_OK or a negative error code (never aborts). */
+int  suspenders_init(unsigned num_workers, unsigned queue_hint);
 void suspenders_run(void);
 void suspenders_shutdown(void);
 
@@ -361,25 +466,20 @@ void suspenders_pool_submit(suspenders_pool_t *pool,
                             void (*fn)(void*), void *arg);
 
 suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz);
+void suspenders_chan_destroy(suspenders_chan_t *ch);
 bool suspenders_chan_send(suspenders_chan_t *ch, void *val);
 bool suspenders_chan_recv(suspenders_chan_t *ch, void *out);
 
 /* Hose API - transport agnostic */
-void  hose_init(hose_t *d, struct buf *b);
-bool  hose_dial(hose_t *d, const char *uri);
-bool  hose_listen(hose_t *d, const char *uri);
-bool  hose_accept(hose_t *d, hose_t *client);
-ssize_t hose_read(hose_t *d, void *dest, size_t len);
-ssize_t hose_write(hose_t *d, const void *src, size_t len);
-ssize_t hose_recvfrom(hose_t *d, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen);
-ssize_t hose_sendto(hose_t *d, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen);
-void  hose_close(hose_t *d);
-
-/* Legacy compatibility: ignore the ring parameter */
-static inline void hose_init_legacy(hose_t *d, void *ring, struct buf *b) {
-    (void)ring;
-    hose_init(d, b);
-}
+void  suspenders_hose_init(suspenders_hose_t *d, struct buf *b);
+bool  suspenders_hose_dial(suspenders_hose_t *d, const char *uri);
+bool  suspenders_hose_listen(suspenders_hose_t *d, const char *uri);
+bool  suspenders_hose_accept(suspenders_hose_t *d, suspenders_hose_t *client);
+ssize_t suspenders_hose_read(suspenders_hose_t *d, void *dest, size_t len);
+ssize_t suspenders_hose_write(suspenders_hose_t *d, const void *src, size_t len);
+ssize_t suspenders_hose_recvfrom(suspenders_hose_t *d, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen);
+ssize_t suspenders_hose_sendto(suspenders_hose_t *d, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen);
+void  suspenders_hose_close(suspenders_hose_t *d);
 
 #if SUSPENDERS_BACKEND_IOURING
 void suspenders_writev_async(int fd, struct iovec *iovs, int count);
@@ -397,20 +497,62 @@ void suspenders_writev_async(int fd, struct iovec *iovs, int count);
  * ============================================================================ */
 #ifdef SUSPENDERS_IMPLEMENTATION
 
+/* The implementation is C11 code. When compiled as C++ (single-TU
+ * convenience), silence pedantic warnings about C idioms such as designated
+ * initializers, {0} aggregate init, and flexible array members. */
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wc99-extensions"
+    #pragma clang diagnostic ignored "-Wc++20-designator"
+    #pragma clang diagnostic ignored "-Wmissing-field-initializers"
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+  #endif
+#endif
+
 #include <stdlib.h>
 #include <stdio.h>
 
+#if SUSPENDERS_BACKEND_IOURING
+    #include <liburing.h>
+#endif
+
+/* Thread-local detailed error */
+SUSPENDERS_TLS int suspenders_errno = SUSPENDERS_OK;
+
+const char *suspenders_strerror(int err) {
+    switch (err) {
+    case SUSPENDERS_OK:       return "ok";
+    case SUSPENDERS_ERROR:    return "system error";
+    case SUSPENDERS_INVAL:    return "invalid argument";
+    case SUSPENDERS_NOMEM:    return "out of memory";
+    case SUSPENDERS_TIMEDOUT: return "deadline expired";
+    case SUSPENDERS_CANCELED: return "operation canceled";
+    case SUSPENDERS_CLOSED:   return "channel closed";
+    case SUSPENDERS_EMPTY:    return "channel empty";
+    case SUSPENDERS_FULL:     return "channel full";
+    case SUSPENDERS_BUSY:     return "resource busy";
+    case SUSPENDERS_NOTINIT:  return "runtime not initialized";
+    case SUSPENDERS_NOTFOUND: return "not found";
+    case SUSPENDERS_PERM:     return "operation not permitted";
+    default:                  return "unknown error";
+    }
+}
+
 /* Thread-local state */
-static __thread suspenders_cr_t *suspenders_running = NULL;
+static SUSPENDERS_TLS suspenders_cr_t *suspenders_running = NULL;
 static suspenders_cr_t *suspenders_main_cr = NULL;
-static __thread suspenders_cr_t *ready_queue_heads[SUSPENDERS_QOS_COUNT] = {0};
-static __thread suspenders_cr_t *ready_queue_tails[SUSPENDERS_QOS_COUNT] = {0};
-static __thread int suspenders_initialized = 0;
+static SUSPENDERS_TLS suspenders_cr_t *ready_queue_heads[SUSPENDERS_QOS_COUNT] = {0};
+static SUSPENDERS_TLS suspenders_cr_t *ready_queue_tails[SUSPENDERS_QOS_COUNT] = {0};
+static SUSPENDERS_TLS int suspenders_initialized = 0;
 static suspenders_atomic_int active_coroutines = 0;
 static suspenders_atomic_uintptr_t zombie_head = 0;
 
 /* Backend instance */
-static __thread struct suspenders_backend_s *suspenders_backend = NULL;
+static SUSPENDERS_TLS struct suspenders_backend_s *suspenders_backend = NULL;
 
 /* Transport registry */
 static const suspenders_transport_ops_t *suspenders_transport_registry[16];
@@ -423,7 +565,7 @@ static void *suspenders_main_fiber = NULL;
 /* ============================================================================
  * BUFFER IMPLEMENTATION
  * ============================================================================ */
-bool buf_append(struct buf *buf, const char *data, ssize_t len) {
+bool buf_append(struct buf *SUSPENDERS_RESTRICT buf, const char *SUSPENDERS_RESTRICT data, ssize_t len) {
     if (len < 0) len = (ssize_t)strlen(data);
     size_t needed = buf->len + (size_t)len;
     if (SUSPENDERS_UNLIKELY(needed >= buf->cap)) {
@@ -444,7 +586,7 @@ bool buf_append(struct buf *buf, const char *data, ssize_t len) {
     return true;
 }
 
-bool buf_append_byte(struct buf *buf, char ch) {
+bool buf_append_byte(struct buf *SUSPENDERS_RESTRICT buf, char ch) {
     if (SUSPENDERS_LIKELY(buf->len < buf->cap)) {
         buf->data[buf->len++] = ch;
         buf->data[buf->len] = '\0';
@@ -453,7 +595,7 @@ bool buf_append_byte(struct buf *buf, char ch) {
     return buf_append(buf, &ch, 1);
 }
 
-void buf_clear(struct buf *buf) {
+void buf_clear(struct buf *SUSPENDERS_RESTRICT buf) {
     if (buf->data) BUF_FREE(buf->data, buf->cap + 1);
     memset(buf, 0, sizeof(*buf));
 }
@@ -721,7 +863,9 @@ static inline void suspenders_zombie_enqueue(suspenders_cr_t *cr) {
     do {
         old_head = suspenders_atomic_load(zombie_head, SUSPENDERS_MEMORY_ORDER_RELAXED);
         cr->next = (suspenders_cr_t*)old_head;
-    } while (!suspenders_atomic_compare_exchange_weak(zombie_head, old_head, (uintptr_t)cr));
+    } while (!suspenders_atomic_compare_exchange_weak(zombie_head, old_head, (uintptr_t)cr,
+                                                      SUSPENDERS_MEMORY_ORDER_RELEASE,
+                                                      SUSPENDERS_MEMORY_ORDER_RELAXED));
 }
 
 void suspenders_cr_exit(void) {
@@ -736,31 +880,6 @@ void suspenders_cr_exit(void) {
         }
     }
     __builtin_unreachable();
-}
-
-/* ============================================================================
- * TICKET LOCK
- * ============================================================================ */
-static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l) {
-    suspenders_atomic_init(l->next_ticket, 0);
-    suspenders_atomic_init(l->now_serving, 0);
-}
-
-static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l) {
-    uint32_t my_ticket = suspenders_atomic_fetch_add(l->next_ticket, 1,
-                                                    SUSPENDERS_MEMORY_ORDER_RELAXED);
-    while (suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_ACQUIRE) != my_ticket) {
-#if defined(SUSPENDERS_ARCH_X86_64)
-        __builtin_ia32_pause();
-#elif defined(SUSPENDERS_ARCH_AARCH64)
-        __asm__ volatile("yield" ::: "memory");
-#endif
-    }
-}
-
-static inline void suspenders_ticket_unlock(suspenders_ticket_lock_t *l) {
-    uint32_t current = suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_RELAXED);
-    suspenders_atomic_store(l->now_serving, current + 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
 }
 
 /* ============================================================================
@@ -839,7 +958,9 @@ void suspenders_boost(suspenders_cr_t *target, suspenders_qos_t new_qos) {
     if (SUSPENDERS_UNLIKELY(!target)) return;
     int current = suspenders_atomic_load(target->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
     while ((int)new_qos < current) {
-        if (suspenders_atomic_compare_exchange_weak(target->effective_qos, current, (int)new_qos))
+        if (suspenders_atomic_compare_exchange_weak(target->effective_qos, current, (int)new_qos,
+                                                    SUSPENDERS_MEMORY_ORDER_RELAXED,
+                                                    SUSPENDERS_MEMORY_ORDER_RELAXED))
             break;
         current = suspenders_atomic_load(target->effective_qos, SUSPENDERS_MEMORY_ORDER_RELAXED);
     }
@@ -1307,22 +1428,22 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
  * TRANSPORT IMPLEMENTATIONS
  * ============================================================================ */
 
-static bool hose_parse_uri(const char *uri, hose_t *d, char *host, int *port, const char **scheme_out) {
-    static const struct { const char *prefix; hose_protocol_t proto; } schemes[] = {
-        {"tcp://",  HOSE_PROTO_TCP},
-        {"udp://",  HOSE_PROTO_UDP},
-        {"unix://", HOSE_PROTO_UNIX},
-        {"pipe://", HOSE_PROTO_PIPE},
-        {"tty://",  HOSE_PROTO_TTY},
+static bool suspenders_hose_parse_uri(const char *uri, suspenders_hose_t *d, char *host, int *port, const char **scheme_out) {
+    static const struct { const char *prefix; suspenders_hose_protocol_t proto; } schemes[] = {
+        {"tcp://",  SUSPENDERS_HOSE_PROTO_TCP},
+        {"udp://",  SUSPENDERS_HOSE_PROTO_UDP},
+        {"unix://", SUSPENDERS_HOSE_PROTO_UNIX},
+        {"pipe://", SUSPENDERS_HOSE_PROTO_PIPE},
+        {"tty://",  SUSPENDERS_HOSE_PROTO_TTY},
     };
     for (size_t i = 0; i < sizeof(schemes)/sizeof(schemes[0]); i++) {
         size_t len = strlen(schemes[i].prefix);
         if (strncmp(uri, schemes[i].prefix, len) == 0) {
             *scheme_out = schemes[i].prefix;
             d->protocol = schemes[i].proto;
-            if (d->protocol == HOSE_PROTO_TCP || d->protocol == HOSE_PROTO_UDP) {
+            if (d->protocol == SUSPENDERS_HOSE_PROTO_TCP || d->protocol == SUSPENDERS_HOSE_PROTO_UDP) {
                 return sscanf(uri + len, "%255[^:]:%d", host, port) == 2;
-            } else if (d->protocol == HOSE_PROTO_UNIX || d->protocol == HOSE_PROTO_PIPE || d->protocol == HOSE_PROTO_TTY) {
+            } else if (d->protocol == SUSPENDERS_HOSE_PROTO_UNIX || d->protocol == SUSPENDERS_HOSE_PROTO_PIPE || d->protocol == SUSPENDERS_HOSE_PROTO_TTY) {
                 strncpy(host, uri + len, 256);
                 host[255] = '\0';
                 *port = 0;
@@ -1337,7 +1458,7 @@ static bool hose_parse_uri(const char *uri, hose_t *d, char *host, int *port, co
 /* ============================================================================
  * TCP TRANSPORT
  * ============================================================================ */
-static bool tcp_dial(hose_t *h, const char *host, int port) {
+static bool tcp_dial(suspenders_hose_t *h, const char *host, int port) {
     h->fd = suspenders_socket(AF_INET, SOCK_STREAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
     if (!suspenders_set_nonblocking(h->fd)) {
@@ -1383,11 +1504,11 @@ static bool tcp_dial(hose_t *h, const char *host, int port) {
         }
     }
 
-    h->roles |= HOSE_ROLE_DIALER | HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_DIALER | SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
     return true;
 }
 
-static bool tcp_listen(hose_t *h, const char *host, int port) {
+static bool tcp_listen(suspenders_hose_t *h, const char *host, int port) {
     (void)host;
     h->fd = suspenders_socket(AF_INET, SOCK_STREAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
@@ -1419,12 +1540,12 @@ static bool tcp_listen(hose_t *h, const char *host, int port) {
         h->fd = SUSPENDERS_INVALID_SOCK;
         return false;
     }
-    h->roles |= HOSE_ROLE_LISTENER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_LISTENER;
     return true;
 }
 
-static bool tcp_accept(hose_t *listener, hose_t *client) {
-    if (!(listener->roles & HOSE_ROLE_LISTENER) || listener->fd == SUSPENDERS_INVALID_SOCK) return false;
+static bool tcp_accept(suspenders_hose_t *listener, suspenders_hose_t *client) {
+    if (!(listener->roles & SUSPENDERS_HOSE_ROLE_LISTENER) || listener->fd == SUSPENDERS_INVALID_SOCK) return false;
 
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
@@ -1434,11 +1555,11 @@ static bool tcp_accept(hose_t *listener, hose_t *client) {
                 suspenders_close_socket(fd);
                 return false;
             }
-            hose_init(client, NULL);
+            suspenders_hose_init(client, NULL);
             client->fd = fd;
             client->protocol = listener->protocol;
             client->transport = listener->transport;
-            client->roles = HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+            client->roles = SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
             return true;
         }
         int err = suspenders_sock_errno();
@@ -1451,8 +1572,8 @@ static bool tcp_accept(hose_t *listener, hose_t *client) {
     }
 }
 
-static ssize_t tcp_read(hose_t *h, void *dest, size_t len) {
-    if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t tcp_read(suspenders_hose_t *h, void *dest, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
 
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
@@ -1468,8 +1589,8 @@ static ssize_t tcp_read(hose_t *h, void *dest, size_t len) {
     }
 }
 
-static ssize_t tcp_write(hose_t *h, const void *src, size_t len) {
-    if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t tcp_write(suspenders_hose_t *h, const void *src, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
 
     suspenders_cr_t *cr = suspenders_running;
     size_t written = 0;
@@ -1491,7 +1612,7 @@ static ssize_t tcp_write(hose_t *h, const void *src, size_t len) {
     return (ssize_t)written;
 }
 
-static void tcp_close(hose_t *h) {
+static void tcp_close(suspenders_hose_t *h) {
     if (h->fd != SUSPENDERS_INVALID_SOCK) {
         suspenders_close_socket(h->fd);
         h->fd = SUSPENDERS_INVALID_SOCK;
@@ -1514,7 +1635,7 @@ static const suspenders_transport_ops_t tcp_transport_ops = {
 /* ============================================================================
  * UDP TRANSPORT
  * ============================================================================ */
-static bool udp_dial(hose_t *h, const char *host, int port) {
+static bool udp_dial(suspenders_hose_t *h, const char *host, int port) {
     h->fd = suspenders_socket(AF_INET, SOCK_DGRAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
     if (!suspenders_set_nonblocking(h->fd)) {
@@ -1535,11 +1656,11 @@ static bool udp_dial(hose_t *h, const char *host, int port) {
         h->fd = SUSPENDERS_INVALID_SOCK;
         return false;
     }
-    h->roles |= HOSE_ROLE_DIALER | HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_DIALER | SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
     return true;
 }
 
-static bool udp_listen(hose_t *h, const char *host, int port) {
+static bool udp_listen(suspenders_hose_t *h, const char *host, int port) {
     (void)host;
     h->fd = suspenders_socket(AF_INET, SOCK_DGRAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
@@ -1559,12 +1680,12 @@ static bool udp_listen(hose_t *h, const char *host, int port) {
         h->fd = SUSPENDERS_INVALID_SOCK;
         return false;
     }
-    h->roles |= HOSE_ROLE_LISTENER | HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_LISTENER | SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
     return true;
 }
 
-static ssize_t udp_read(hose_t *h, void *dest, size_t len) {
-    if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t udp_read(suspenders_hose_t *h, void *dest, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_recv(h->fd, dest, len, 0);
@@ -1578,8 +1699,8 @@ static ssize_t udp_read(hose_t *h, void *dest, size_t len) {
     }
 }
 
-static ssize_t udp_write(hose_t *h, const void *src, size_t len) {
-    if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t udp_write(suspenders_hose_t *h, const void *src, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_send(h->fd, src, len, 0);
@@ -1593,8 +1714,8 @@ static ssize_t udp_write(hose_t *h, const void *src, size_t len) {
     }
 }
 
-static ssize_t udp_recvfrom(hose_t *h, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen) {
-    if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t udp_recvfrom(suspenders_hose_t *h, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
@@ -1612,8 +1733,8 @@ static ssize_t udp_recvfrom(hose_t *h, void *dest, size_t len, struct sockaddr *
     }
 }
 
-static ssize_t udp_sendto(hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen) {
-    if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t udp_sendto(suspenders_hose_t *h, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
@@ -1631,7 +1752,7 @@ static ssize_t udp_sendto(hose_t *h, const void *src, size_t len, const struct s
     }
 }
 
-static void udp_close(hose_t *h) {
+static void udp_close(suspenders_hose_t *h) {
     if (h->fd != SUSPENDERS_INVALID_SOCK) {
         suspenders_close_socket(h->fd);
         h->fd = SUSPENDERS_INVALID_SOCK;
@@ -1656,7 +1777,7 @@ static const suspenders_transport_ops_t udp_transport_ops = {
  * ============================================================================ */
 #if !defined(SUSPENDERS_PLATFORM_WINDOWS)
 
-static bool unix_dial(hose_t *h, const char *path, int port) {
+static bool unix_dial(suspenders_hose_t *h, const char *path, int port) {
     (void)port;
     h->fd = suspenders_socket(AF_UNIX, SOCK_STREAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
@@ -1695,11 +1816,11 @@ static bool unix_dial(hose_t *h, const char *path, int port) {
             return false;
         }
     }
-    h->roles |= HOSE_ROLE_DIALER | HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_DIALER | SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
     return true;
 }
 
-static bool unix_listen(hose_t *h, const char *path, int port) {
+static bool unix_listen(suspenders_hose_t *h, const char *path, int port) {
     (void)port;
     h->fd = suspenders_socket(AF_UNIX, SOCK_STREAM, 0);
     if (h->fd == SUSPENDERS_INVALID_SOCK) return false;
@@ -1725,12 +1846,12 @@ static bool unix_listen(hose_t *h, const char *path, int port) {
         h->fd = SUSPENDERS_INVALID_SOCK;
         return false;
     }
-    h->roles |= HOSE_ROLE_LISTENER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_LISTENER;
     return true;
 }
 
-static bool unix_accept(hose_t *listener, hose_t *client) {
-    if (!(listener->roles & HOSE_ROLE_LISTENER) || listener->fd == SUSPENDERS_INVALID_SOCK) return false;
+static bool unix_accept(suspenders_hose_t *listener, suspenders_hose_t *client) {
+    if (!(listener->roles & SUSPENDERS_HOSE_ROLE_LISTENER) || listener->fd == SUSPENDERS_INVALID_SOCK) return false;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
         suspenders_sock_t fd = accept(listener->fd, NULL, NULL);
@@ -1739,11 +1860,11 @@ static bool unix_accept(hose_t *listener, hose_t *client) {
                 suspenders_close_socket(fd);
                 return false;
             }
-            hose_init(client, NULL);
+            suspenders_hose_init(client, NULL);
             client->fd = fd;
             client->protocol = listener->protocol;
             client->transport = listener->transport;
-            client->roles = HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+            client->roles = SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
             return true;
         }
         int err = suspenders_sock_errno();
@@ -1755,8 +1876,8 @@ static bool unix_accept(hose_t *listener, hose_t *client) {
     }
 }
 
-static ssize_t unix_read(hose_t *h, void *dest, size_t len) {
-    if (!(h->roles & HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t unix_read(suspenders_hose_t *h, void *dest, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_READER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     while (1) {
         ssize_t n = suspenders_sock_recv(h->fd, dest, len, 0);
@@ -1770,8 +1891,8 @@ static ssize_t unix_read(hose_t *h, void *dest, size_t len) {
     }
 }
 
-static ssize_t unix_write(hose_t *h, const void *src, size_t len) {
-    if (!(h->roles & HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
+static ssize_t unix_write(suspenders_hose_t *h, const void *src, size_t len) {
+    if (!(h->roles & SUSPENDERS_HOSE_ROLE_WRITER) || h->fd == SUSPENDERS_INVALID_SOCK) return -1;
     suspenders_cr_t *cr = suspenders_running;
     size_t written = 0;
     while (written < len) {
@@ -1791,7 +1912,7 @@ static ssize_t unix_write(hose_t *h, const void *src, size_t len) {
     return (ssize_t)written;
 }
 
-static void unix_close(hose_t *h) {
+static void unix_close(suspenders_hose_t *h) {
     if (h->fd != SUSPENDERS_INVALID_SOCK) {
         suspenders_close_socket(h->fd);
         h->fd = SUSPENDERS_INVALID_SOCK;
@@ -1816,7 +1937,7 @@ static const suspenders_transport_ops_t unix_transport_ops = {
 /* ============================================================================
  * TTY TRANSPORT
  * ============================================================================ */
-static bool tty_dial(hose_t *h, const char *device, int port) {
+static bool tty_dial(suspenders_hose_t *h, const char *device, int port) {
     (void)port;
     int fd = -1;
     if (strcmp(device, "stdin") == 0) fd = 0;
@@ -1825,11 +1946,11 @@ static bool tty_dial(hose_t *h, const char *device, int port) {
     else return false;
 
     h->fd = (suspenders_sock_t)fd;
-    h->roles |= HOSE_ROLE_READER | HOSE_ROLE_WRITER;
+    h->roles |= SUSPENDERS_HOSE_ROLE_READER | SUSPENDERS_HOSE_ROLE_WRITER;
     return true;
 }
 
-static void tty_close(hose_t *h) {
+static void tty_close(suspenders_hose_t *h) {
     h->fd = SUSPENDERS_INVALID_SOCK;
     h->roles = 0;
 }
@@ -1849,17 +1970,17 @@ static const suspenders_transport_ops_t tty_transport_ops = {
 /* ============================================================================
  * HOSE API
  * ============================================================================ */
-void hose_init(hose_t *d, struct buf *b) {
+void suspenders_hose_init(suspenders_hose_t *d, struct buf *b) {
     memset(d, 0, sizeof(*d));
     d->fd = SUSPENDERS_INVALID_SOCK;
     d->buffer = b;
 }
 
-bool hose_dial(hose_t *d, const char *uri) {
+bool suspenders_hose_dial(suspenders_hose_t *d, const char *uri) {
     char host[256] = {0};
     int port = 0;
     const char *scheme = NULL;
-    if (!hose_parse_uri(uri, d, host, &port, &scheme)) return false;
+    if (!suspenders_hose_parse_uri(uri, d, host, &port, &scheme)) return false;
 
     const suspenders_transport_ops_t *ops = suspenders_transport_find(scheme);
     if (!ops || !ops->dial) return false;
@@ -1868,11 +1989,11 @@ bool hose_dial(hose_t *d, const char *uri) {
     return ops->dial(d, host, port);
 }
 
-bool hose_listen(hose_t *d, const char *uri) {
+bool suspenders_hose_listen(suspenders_hose_t *d, const char *uri) {
     char host[256] = {0};
     int port = 0;
     const char *scheme = NULL;
-    if (!hose_parse_uri(uri, d, host, &port, &scheme)) return false;
+    if (!suspenders_hose_parse_uri(uri, d, host, &port, &scheme)) return false;
 
     const suspenders_transport_ops_t *ops = suspenders_transport_find(scheme);
     if (!ops || !ops->listen) return false;
@@ -1881,32 +2002,32 @@ bool hose_listen(hose_t *d, const char *uri) {
     return ops->listen(d, host, port);
 }
 
-bool hose_accept(hose_t *d, hose_t *client) {
+bool suspenders_hose_accept(suspenders_hose_t *d, suspenders_hose_t *client) {
     if (!d->transport || !d->transport->accept) return false;
     return d->transport->accept(d, client);
 }
 
-ssize_t hose_read(hose_t *d, void *dest, size_t len) {
+ssize_t suspenders_hose_read(suspenders_hose_t *d, void *dest, size_t len) {
     if (!d->transport || !d->transport->read) return -1;
     return d->transport->read(d, dest, len);
 }
 
-ssize_t hose_write(hose_t *d, const void *src, size_t len) {
+ssize_t suspenders_hose_write(suspenders_hose_t *d, const void *src, size_t len) {
     if (!d->transport || !d->transport->write) return -1;
     return d->transport->write(d, src, len);
 }
 
-ssize_t hose_recvfrom(hose_t *d, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen) {
+ssize_t suspenders_hose_recvfrom(suspenders_hose_t *d, void *dest, size_t len, struct sockaddr *addr, socklen_t *addrlen) {
     if (!d->transport || !d->transport->recvfrom) return -1;
     return d->transport->recvfrom(d, dest, len, addr, addrlen);
 }
 
-ssize_t hose_sendto(hose_t *d, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen) {
+ssize_t suspenders_hose_sendto(suspenders_hose_t *d, const void *src, size_t len, const struct sockaddr *addr, socklen_t addrlen) {
     if (!d->transport || !d->transport->sendto) return -1;
     return d->transport->sendto(d, src, len, addr, addrlen);
 }
 
-void hose_close(hose_t *d) {
+void suspenders_hose_close(suspenders_hose_t *d) {
     if (d->transport && d->transport->close) {
         d->transport->close(d);
     } else {
@@ -1955,7 +2076,7 @@ typedef struct {
     size_t cap;
 } suspenders_timer_heap_t;
 
-static __thread suspenders_timer_heap_t suspenders_timer_heap = {0};
+static SUSPENDERS_TLS suspenders_timer_heap_t suspenders_timer_heap = {0};
 
 static bool suspenders_timer_heap_ensure_cap(suspenders_timer_heap_t *h, size_t needed) {
     if (needed <= h->cap) return true;
@@ -2109,7 +2230,7 @@ typedef struct {
     void *arg;
 } suspenders_task_t;
 
-static void suspenders_chan_destroy(suspenders_chan_t *ch) {
+void suspenders_chan_destroy(suspenders_chan_t *ch) {
     if (!ch) return;
     memento_thread_heap_free(memento_thread_heap_get(), ch, sizeof(*ch));
 }
@@ -2258,20 +2379,20 @@ void suspenders_pool_submit(suspenders_pool_t *pool,
 /* ============================================================================
  * SCHEDULER INITIALIZATION & LIFECYCLE
  * ============================================================================ */
-void suspenders_init(unsigned num_workers, unsigned queue_hint) {
+int suspenders_init(unsigned num_workers, unsigned queue_hint) {
     (void)num_workers;
 
     memento_init();
     memento_thread_heap_t *heap = memento_thread_heap_get();
     if (SUSPENDERS_UNLIKELY(!heap)) {
-        fprintf(stderr, "suspenders: failed to initialize thread heap\n");
-        abort();
+        suspenders_errno = SUSPENDERS_NOMEM;
+        return SUSPENDERS_NOMEM;
     }
 
     suspenders_backend = s_backend_create(queue_hint);
     if (SUSPENDERS_UNLIKELY(!suspenders_backend)) {
-        fprintf(stderr, "suspenders: event backend init failed\n");
-        abort();
+        suspenders_errno = SUSPENDERS_ERROR;
+        return SUSPENDERS_ERROR;
     }
 
     suspenders_transport_register(&tcp_transport_ops);
@@ -2287,6 +2408,7 @@ void suspenders_init(unsigned num_workers, unsigned queue_hint) {
 #endif
 
     suspenders_initialized = 1;
+    return SUSPENDERS_OK;
 }
 
 void suspenders_run(void) {
@@ -2400,6 +2522,15 @@ void suspenders_writev_async(int fd, struct iovec *iovs, int count) {
     io_uring_sqe_set_data(sqe, suspenders_running);
     suspenders_suspend();
 }
+#endif
+
+
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic pop
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic pop
+  #endif
 #endif
 
 #endif /* SUSPENDERS_IMPLEMENTATION */

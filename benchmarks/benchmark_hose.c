@@ -1,10 +1,12 @@
 /* benchmark_hose.c - Hose (TCP) latency benchmark
  *
- * Measures round-trip latency of hose_read/hose_write over loopback TCP.
+ * Measures round-trip latency of suspenders_hose_read/suspenders_hose_write over loopback TCP.
  * One server handler and one client exchange messages as fast as possible.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -30,59 +32,59 @@ static inline uint64_t get_time_ns(void) {
 static volatile int server_ready = 0;
 static volatile int client_done = 0;
 
-void hose_server_handler(void *arg) {
-    hose_t *client = (hose_t*)arg;
+void suspenders_hose_server_handler(void *arg) {
+    suspenders_hose_t *client = (suspenders_hose_t*)arg;
     char buf[MSG_SIZE];
 
     while (1) {
-        ssize_t n = hose_read(client, buf, sizeof(buf));
+        ssize_t n = suspenders_hose_read(client, buf, sizeof(buf));
         if (n <= 0) break;
-        if (hose_write(client, buf, n) <= 0) break;
+        if (suspenders_hose_write(client, buf, n) <= 0) break;
     }
 
-    hose_close(client);
-    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
 }
 
-void hose_server_listener(void *arg) {
+void suspenders_hose_server_listener(void *arg) {
     (void)arg;
-    hose_t listener;
-    hose_init(&listener, NULL);
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", SERVER_PORT);
-    if (!hose_listen(&listener, uri)) {
+    if (!suspenders_hose_listen(&listener, uri)) {
         fprintf(stderr, "[bench] listen failed\n");
         return;
     }
 
     server_ready = 1;
 
-    hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(hose_t));
-    if (!client) { hose_close(&listener); return; }
+    suspenders_hose_t *client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(suspenders_hose_t));
+    if (!client) { suspenders_hose_close(&listener); return; }
 
-    if (!hose_accept(&listener, client)) {
-        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(hose_t));
-        hose_close(&listener);
+    if (!suspenders_hose_accept(&listener, client)) {
+        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(suspenders_hose_t));
+        suspenders_hose_close(&listener);
         return;
     }
 
-    suspenders_spawn(hose_server_handler, client, SUSPENDERS_QOS_NORMAL);
-    hose_close(&listener);
+    suspenders_spawn(suspenders_hose_server_handler, client, SUSPENDERS_QOS_NORMAL);
+    suspenders_hose_close(&listener);
 }
 
-void hose_client(void *arg) {
+void suspenders_hose_client(void *arg) {
     (void)arg;
     while (!server_ready)
         suspenders_yield();
 
-    hose_t conn;
+    suspenders_hose_t conn;
     struct buf b = {0};
-    hose_init(&conn, &b);
+    suspenders_hose_init(&conn, &b);
 
     char uri[64];
     snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", SERVER_PORT);
-    if (!hose_dial(&conn, uri)) {
+    if (!suspenders_hose_dial(&conn, uri)) {
         fprintf(stderr, "[bench] dial failed\n");
         return;
     }
@@ -92,12 +94,12 @@ void hose_client(void *arg) {
     memset(send_buf, 'x', sizeof(send_buf));
 
     for (int i = 0; i < ITERATIONS; i++) {
-        if (hose_write(&conn, send_buf, sizeof(send_buf)) <= 0) break;
-        ssize_t n = hose_read(&conn, recv_buf, sizeof(recv_buf));
+        if (suspenders_hose_write(&conn, send_buf, sizeof(send_buf)) <= 0) break;
+        ssize_t n = suspenders_hose_read(&conn, recv_buf, sizeof(recv_buf));
         if (n <= 0) break;
     }
 
-    hose_close(&conn);
+    suspenders_hose_close(&conn);
     client_done = 1;
 }
 
@@ -109,8 +111,8 @@ int main(int argc, char *argv[]) {
     printf("Transport:  loopback TCP\n\n");
 
     suspenders_init(0, 256);
-    suspenders_spawn(hose_server_listener, NULL, SUSPENDERS_QOS_HIGH);
-    suspenders_spawn(hose_client, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(suspenders_hose_server_listener, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(suspenders_hose_client, NULL, SUSPENDERS_QOS_NORMAL);
 
     uint64_t start = get_time_ns();
     suspenders_run();

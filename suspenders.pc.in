@@ -1,0 +1,9 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: suspenders
+Description: Header-only C11 stackful coroutine library with io_uring async I/O
+Version: @PROJECT_VERSION@
+Requires.private: liburing >= 2.0
+Cflags: -I${includedir}
+Libs: -lpthread

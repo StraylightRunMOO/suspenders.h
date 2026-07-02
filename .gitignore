@@ -167,3 +167,4 @@ core
 core.*
 vcore.*
 *.core
+build-*/
