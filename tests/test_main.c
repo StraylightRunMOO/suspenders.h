@@ -584,6 +584,443 @@ static int test_hose_cross_owner(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test 16: Identity - getid/setname/getname/self/stack_size/go              */
+/* -------------------------------------------------------------------------- */
+static volatile int ident_ok = 0;
+static volatile uint64_t ident_first_id = 0;
+
+void ident_second(void *arg) {
+    (void)arg;
+    if (suspenders_getid() != 0 && suspenders_getid() != ident_first_id)
+        ident_ok++;
+}
+
+void ident_cr(void *arg) {
+    (void)arg;
+    ident_first_id = suspenders_getid();
+    if (ident_first_id == 0) return;
+    if (suspenders_self() == NULL) return;
+    if (suspenders_stack_size() != SUSPENDERS_STACK_SIZE) return;
+    if (suspenders_setname("ident-worker") != SUSPENDERS_OK) return;
+    if (strcmp(suspenders_getname(), "ident-worker") != 0) return;
+    ident_ok++;
+    suspenders_go(ident_second, NULL);
+}
+
+static int test_identity(void) {
+    ident_ok = 0;
+    ident_first_id = 0;
+    suspenders_init(st_workers(), 256);
+    /* Outside a coroutine there is no identity. */
+    ASSERT_EQ_INT(0, (int)suspenders_getid());
+    ASSERT_NULL(suspenders_self());
+    suspenders_spawn(ident_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(2, ident_ok);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 17: Sleep and cancel-while-sleeping                                  */
+/* -------------------------------------------------------------------------- */
+static volatile int sleep_status = 12345;
+static volatile int sleep_cancel_status = 12345;
+static volatile uint64_t sleep_elapsed_ns = 0;
+static suspenders_cr_t *sleeping_cr = NULL;
+
+void sleeper(void *arg) {
+    (void)arg;
+    uint64_t start = suspenders_now_ns();
+    sleep_status = suspenders_sleep_ns(20 * 1000000ULL);  /* 20ms */
+    sleep_elapsed_ns = suspenders_now_ns() - start;
+}
+
+void canceled_sleeper(void *arg) {
+    (void)arg;
+    sleep_cancel_status = suspenders_sleep_ns(10ULL * 1000000000ULL); /* 10s */
+}
+
+void sleep_canceler(void *arg) {
+    (void)arg;
+    suspenders_yield();  /* let the sleeper park */
+    suspenders_cancel(sleeping_cr);
+}
+
+static int test_sleep_and_cancel(void) {
+    sleep_status = sleep_cancel_status = 12345;
+    sleep_elapsed_ns = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(sleeper, NULL, SUSPENDERS_QOS_NORMAL);
+    sleeping_cr = suspenders_spawn(canceled_sleeper, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(sleep_canceler, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(SUSPENDERS_OK, sleep_status);
+    ASSERT_TRUE(sleep_elapsed_ns >= 15 * 1000000ULL);  /* slept most of 20ms */
+    ASSERT_EQ_INT(SUSPENDERS_CANCELED, sleep_cancel_status);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 18: Cleanup handlers - LIFO, pop with/without execute, run at exit   */
+/* -------------------------------------------------------------------------- */
+static char cleanup_log[8];
+static volatile int cleanup_log_idx = 0;
+
+static void cleanup_append(void *arg) {
+    cleanup_log[cleanup_log_idx++] = (char)(intptr_t)arg;
+}
+
+void cleanup_cr(void *arg) {
+    (void)arg;
+    suspenders_cleanup_t a, b, c, d;
+    suspenders_cleanup_push(&a, cleanup_append, (void*)(intptr_t)'A');
+    suspenders_cleanup_push(&b, cleanup_append, (void*)(intptr_t)'B');
+    suspenders_cleanup_push(&c, cleanup_append, (void*)(intptr_t)'C');
+    suspenders_cleanup_push(&d, cleanup_append, (void*)(intptr_t)'D');
+    suspenders_cleanup_pop(1);   /* runs D */
+    suspenders_cleanup_pop(0);   /* discards C */
+    /* B then A run now (LIFO), while this frame is still live. */
+    suspenders_exit();
+    cleanup_log[cleanup_log_idx++] = 'X';   /* must not be reached */
+}
+
+static int test_cleanup_handlers(void) {
+    cleanup_log_idx = 0;
+    memset(cleanup_log, 0, sizeof(cleanup_log));
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(cleanup_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(3, cleanup_log_idx);
+    ASSERT_TRUE(cleanup_log[0] == 'D' && cleanup_log[1] == 'B' && cleanup_log[2] == 'A');
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 19: Deadline - sleeping past the deadline fails with TIMEDOUT        */
+/* -------------------------------------------------------------------------- */
+static volatile int deadline_sleep_status = 12345;
+static volatile int deadline_next_status = 12345;
+static volatile int deadline_disarm_status = 12345;
+
+void deadline_cr(void *arg) {
+    (void)arg;
+    suspenders_deadline(suspenders_now_ns() + 10 * 1000000ULL);   /* 10ms */
+    deadline_sleep_status = suspenders_sleep_ns(10ULL * 1000000000ULL);
+    /* Deadline stays expired for subsequent blocking calls... */
+    deadline_next_status = suspenders_sleep_ns(1000000ULL);
+    /* ...until disarmed. */
+    suspenders_deadline(0);
+    deadline_disarm_status = suspenders_sleep_ns(1000000ULL);
+}
+
+static int test_deadline(void) {
+    deadline_sleep_status = deadline_next_status = deadline_disarm_status = 12345;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(deadline_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, deadline_sleep_status);
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, deadline_next_status);
+    ASSERT_EQ_INT(SUSPENDERS_OK, deadline_disarm_status);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 20: Mutex - exclusion, FIFO handoff, trylock, priority inheritance   */
+/* -------------------------------------------------------------------------- */
+static suspenders_mutex_t test_mtx;
+static volatile int mtx_in_critical = 0;
+static volatile int mtx_violations = 0;
+static volatile int mtx_order[4];
+static volatile int mtx_order_idx = 0;
+static volatile int mtx_trylock_busy = 0;
+static volatile int mtx_pi_boosted = 0;
+
+void mtx_high_contender(void *arg);
+
+void mtx_holder(void *arg) {
+    (void)arg;
+    suspenders_mutex_lock(&test_mtx);
+    mtx_in_critical = 1;
+    /* Spawn the HIGH-qos contender only after the lock is held so it
+     * actually contends (and boosts us). */
+    suspenders_spawn(mtx_high_contender, NULL, SUSPENDERS_QOS_HIGH);
+    /* Yield a few times so contenders queue up (and trylock fails). */
+    for (int i = 0; i < 4; i++) suspenders_yield();
+    if (suspenders_mutex_trylock(&test_mtx) == SUSPENDERS_BUSY)
+        mtx_trylock_busy = 1;
+    /* A HIGH-qos contender should have boosted us by now. */
+    if (suspenders_atomic_load(suspenders_self()->effective_qos,
+                               SUSPENDERS_MEMORY_ORDER_RELAXED) == SUSPENDERS_QOS_HIGH)
+        mtx_pi_boosted = 1;
+    mtx_in_critical = 0;
+    suspenders_mutex_unlock(&test_mtx);
+}
+
+void mtx_contender(void *arg) {
+    int tag = (int)(intptr_t)arg;
+    if (suspenders_mutex_lock(&test_mtx) != SUSPENDERS_OK) { mtx_violations++; return; }
+    if (mtx_in_critical) mtx_violations++;
+    mtx_in_critical = 1;
+    mtx_order[mtx_order_idx++] = tag;
+    suspenders_yield();
+    mtx_in_critical = 0;
+    suspenders_mutex_unlock(&test_mtx);
+}
+
+void mtx_high_contender(void *arg) {
+    (void)arg;
+    if (suspenders_mutex_lock(&test_mtx) != SUSPENDERS_OK) { mtx_violations++; return; }
+    if (mtx_in_critical) mtx_violations++;
+    suspenders_mutex_unlock(&test_mtx);
+}
+
+static int test_mutex(void) {
+    suspenders_mutex_init(&test_mtx);
+    mtx_in_critical = 0;
+    mtx_violations = 0;
+    mtx_order_idx = 0;
+    mtx_trylock_busy = 0;
+    mtx_pi_boosted = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(mtx_holder, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(mtx_contender, (void*)1, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(mtx_contender, (void*)2, SUSPENDERS_QOS_NORMAL);
+    /* the HIGH contender is spawned by the holder once it owns the lock */
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(0, mtx_violations);
+    ASSERT_EQ_INT(1, mtx_trylock_busy);
+    ASSERT_EQ_INT(1, mtx_pi_boosted);
+    /* FIFO: contender 1 queued before contender 2 */
+    ASSERT_EQ_INT(1, mtx_order[0]);
+    ASSERT_EQ_INT(2, mtx_order[1]);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 21: Mutex lock with deadline times out                               */
+/* -------------------------------------------------------------------------- */
+static volatile int mtx_dl_status = 12345;
+
+void mtx_dl_holder(void *arg) {
+    (void)arg;
+    suspenders_mutex_lock(&test_mtx);
+    suspenders_sleep_ns(50 * 1000000ULL);   /* hold for 50ms */
+    suspenders_mutex_unlock(&test_mtx);
+}
+
+void mtx_dl_waiter(void *arg) {
+    (void)arg;
+    suspenders_yield();  /* let the holder take the lock */
+    mtx_dl_status = suspenders_mutex_lock_dl(&test_mtx,
+                                             suspenders_now_ns() + 5 * 1000000ULL);
+}
+
+static int test_mutex_deadline(void) {
+    suspenders_mutex_init(&test_mtx);
+    mtx_dl_status = 12345;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(mtx_dl_holder, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(mtx_dl_waiter, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, mtx_dl_status);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 22: RWLock - shared readers, exclusive writer, try variants          */
+/* -------------------------------------------------------------------------- */
+static suspenders_rwlock_t test_rw;
+static volatile int rw_concurrent_readers = 0;
+static volatile int rw_max_readers = 0;
+static volatile int rw_writer_alone = 1;
+static volatile int rw_try_busy = 0;
+
+void rw_reader(void *arg) {
+    (void)arg;
+    if (suspenders_rwlock_rdlock(&test_rw) != SUSPENDERS_OK) return;
+    rw_concurrent_readers++;
+    if (rw_concurrent_readers > rw_max_readers)
+        rw_max_readers = rw_concurrent_readers;
+    suspenders_yield();
+    suspenders_yield();
+    rw_concurrent_readers--;
+    suspenders_rwlock_unlock(&test_rw);
+}
+
+void rw_writer_cr(void *arg) {
+    (void)arg;
+    if (suspenders_rwlock_trywrlock(&test_rw) == SUSPENDERS_BUSY)
+        rw_try_busy = 1;
+    if (suspenders_rwlock_wrlock(&test_rw) != SUSPENDERS_OK) return;
+    if (rw_concurrent_readers != 0) rw_writer_alone = 0;
+    suspenders_yield();
+    if (rw_concurrent_readers != 0) rw_writer_alone = 0;
+    suspenders_rwlock_unlock(&test_rw);
+}
+
+static int test_rwlock(void) {
+    suspenders_rwlock_init(&test_rw);
+    rw_concurrent_readers = 0;
+    rw_max_readers = 0;
+    rw_writer_alone = 1;
+    rw_try_busy = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(rw_reader, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(rw_reader, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(rw_reader, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(rw_writer_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(rw_reader, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_TRUE(rw_max_readers >= 2);      /* readers overlapped */
+    ASSERT_EQ_INT(1, rw_writer_alone);     /* writer was exclusive */
+    ASSERT_EQ_INT(1, rw_try_busy);         /* trywrlock saw readers */
+    ASSERT_EQ_INT(0, rw_concurrent_readers);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 23: Condition variable - signal and broadcast                        */
+/* -------------------------------------------------------------------------- */
+static suspenders_mutex_t cond_mtx;
+static suspenders_cond_t  test_cond;
+static volatile int cond_stage = 0;
+static volatile int cond_woken = 0;
+
+void cond_waiter(void *arg) {
+    (void)arg;
+    suspenders_mutex_lock(&cond_mtx);
+    while (cond_stage == 0) {
+        if (suspenders_cond_wait(&test_cond, &cond_mtx) != SUSPENDERS_OK) break;
+    }
+    cond_woken++;
+    suspenders_mutex_unlock(&cond_mtx);
+}
+
+void cond_signaler(void *arg) {
+    (void)arg;
+    /* Let all waiters park. */
+    for (int i = 0; i < 4; i++) suspenders_yield();
+    suspenders_mutex_lock(&cond_mtx);
+    cond_stage = 1;
+    suspenders_mutex_unlock(&cond_mtx);
+    suspenders_cond_signal(&test_cond);      /* wakes one */
+    for (int i = 0; i < 4; i++) suspenders_yield();
+    suspenders_cond_broadcast(&test_cond);   /* wakes the rest */
+}
+
+static int test_cond_var(void) {
+    suspenders_mutex_init(&cond_mtx);
+    suspenders_cond_init(&test_cond);
+    cond_stage = 0;
+    cond_woken = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(cond_waiter, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(cond_waiter, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(cond_waiter, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(cond_signaler, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(3, cond_woken);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 24: Waitgroup - wait until N workers finish, and _dl timeout         */
+/* -------------------------------------------------------------------------- */
+static suspenders_waitgroup_t test_wg;
+static volatile int wg_done_count = 0;
+static volatile int wg_wait_status = 12345;
+static volatile int wg_seen_at_wake = -1;
+static volatile int wg_dl_status = 12345;
+
+void wg_worker(void *arg) {
+    (void)arg;
+    suspenders_sleep_ns(2 * 1000000ULL);
+    wg_done_count++;
+    suspenders_waitgroup_done(&test_wg);
+}
+
+void wg_waiter(void *arg) {
+    (void)arg;
+    wg_wait_status = suspenders_waitgroup_wait(&test_wg);
+    wg_seen_at_wake = wg_done_count;
+}
+
+void wg_dl_waiter(void *arg) {
+    suspenders_waitgroup_t *never = (suspenders_waitgroup_t*)arg;
+    wg_dl_status = suspenders_waitgroup_wait_dl(never,
+                                                suspenders_now_ns() + 5 * 1000000ULL);
+}
+
+static int test_waitgroup(void) {
+    static suspenders_waitgroup_t never_wg;
+    suspenders_waitgroup_init(&test_wg);
+    suspenders_waitgroup_init(&never_wg);
+    suspenders_waitgroup_add(&never_wg, 1);
+    wg_done_count = 0;
+    wg_wait_status = 12345;
+    wg_seen_at_wake = -1;
+    wg_dl_status = 12345;
+    suspenders_init(st_workers(), 256);
+    suspenders_waitgroup_add(&test_wg, 3);
+    suspenders_spawn(wg_waiter, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(wg_worker, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(wg_worker, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(wg_worker, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(wg_dl_waiter, &never_wg, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    ASSERT_EQ_INT(SUSPENDERS_OK, wg_wait_status);
+    ASSERT_EQ_INT(3, wg_seen_at_wake);
+    ASSERT_EQ_INT(SUSPENDERS_TIMEDOUT, wg_dl_status);
+    /* never_wg still holds count 1; draining past zero is rejected. */
+    ASSERT_EQ_INT(SUSPENDERS_OK, suspenders_waitgroup_done(&never_wg));
+    ASSERT_EQ_INT(SUSPENDERS_INVAL, suspenders_waitgroup_done(&never_wg));
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 25: Cancel a coroutine blocked on a channel                          */
+/* -------------------------------------------------------------------------- */
+static volatile int chan_cancel_result = 12345;
+static suspenders_cr_t *blocked_receiver_cr = NULL;
+
+void blocked_receiver(void *arg) {
+    (void)arg;
+    int val = 0;
+    chan_cancel_result = suspenders_chan_recv(test_ch, &val) ? 1 : 0;
+}
+
+void chan_canceler(void *arg) {
+    (void)arg;
+    suspenders_yield();   /* let the receiver park */
+    suspenders_cancel(blocked_receiver_cr);
+}
+
+static int test_channel_cancel(void) {
+    chan_cancel_result = 12345;
+    suspenders_init(st_workers(), 256);
+    test_ch = suspenders_chan_create(sizeof(int), 0);
+    ASSERT_NOT_NULL(test_ch);
+    blocked_receiver_cr = suspenders_spawn(blocked_receiver, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(chan_canceler, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_chan_destroy(test_ch);
+    test_ch = NULL;
+    suspenders_shutdown();
+    ASSERT_EQ_INT(0, chan_cancel_result);   /* recv failed with cancel */
+    ASSERT_EQ_INT(SUSPENDERS_CANCELED, suspenders_errno);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 static const st_test_t st_tests[] = {
@@ -602,6 +1039,16 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_spawn_chain),
     ST_TEST(test_hose_dial_failure),
     ST_TEST(test_hose_cross_owner),
+    ST_TEST(test_identity),
+    ST_TEST(test_sleep_and_cancel),
+    ST_TEST(test_cleanup_handlers),
+    ST_TEST(test_deadline),
+    ST_TEST(test_mutex),
+    ST_TEST(test_mutex_deadline),
+    ST_TEST(test_rwlock),
+    ST_TEST(test_cond_var),
+    ST_TEST(test_waitgroup),
+    ST_TEST(test_channel_cancel),
 };
 
 int main(int argc, char **argv) {

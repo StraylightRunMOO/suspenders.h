@@ -41,12 +41,17 @@ void controller(void *arg) {
     for (int i = 0; i < NUM_WORKERS; i++)
         workers[i] = suspenders_spawn(worker, (void*)(intptr_t)i, SUSPENDERS_QOS_NORMAL);
 
-    /* Round-robin resume each worker for each step */
+    /* Let the workers run their first step and suspend. The controller runs
+     * at LOW QoS so a yield always lets every worker go first. */
+    suspenders_yield();
+
+    /* Round-robin resume each worker for each remaining step */
     for (int step = 0; step < WORK_STEPS; step++) {
         printf("Controller: round %d\n", step + 1);
         for (int i = 0; i < NUM_WORKERS; i++) {
             suspenders_resume(workers[i]);
         }
+        suspenders_yield();  /* let the resumed workers run this step */
     }
 
     printf("Controller: all workers should be done\n");
@@ -57,7 +62,7 @@ int main(void) {
     printf("=== Suspenders Suspend/Resume Demo ===\n\n");
 
     suspenders_init(0, 256);
-    suspenders_spawn(controller, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(controller, NULL, SUSPENDERS_QOS_LOW);
 
     suspenders_run();
     suspenders_shutdown();
