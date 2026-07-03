@@ -110,6 +110,11 @@ add_test(NAME suspenders_unit_tests COMMAND suspenders-tests)
 add_suspenders_executable(test-memento tests/test_memento.c)
 add_test(NAME memento_unit_tests COMMAND test-memento)
 
+# Same suite pinned to the portable poll backend (keeps the readiness path verified)
+add_suspenders_executable(suspenders-tests-poll tests/test_main.c)
+target_compile_definitions(suspenders-tests-poll PRIVATE SUSPENDERS_FORCE_POLL)
+add_test(NAME suspenders_unit_tests_poll COMMAND suspenders-tests-poll)
+
 # Benchmarks
 add_suspenders_executable(suspenders-benchmark benchmarks/benchmark_suspenders.c)
 target_link_libraries(suspenders-benchmark PRIVATE ${MATH_LIBRARY})

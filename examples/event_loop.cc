@@ -35,7 +35,8 @@ int main() {
 
             while (ticks < 8) {
                 suspenders::Hose client;
-                if (listener.accept(client)) {
+                /* Deadline-bounded accept so the loop re-checks the tick count. */
+                if (listener.accept_dl(client, suspenders::now_ns() + 250'000'000ULL)) {
                     suspenders::spawn([c = std::move(client)]() mutable {
                         handle_client(std::move(c));
                     });
