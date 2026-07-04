@@ -232,6 +232,104 @@ public:
 };
 
 // ============================================================================
+// Synchronization Primitives (value types over the C API)
+// ============================================================================
+
+class Mutex {
+    suspenders_mutex_t m_;
+public:
+    Mutex() { suspenders_mutex_init(&m_); }
+    Mutex(const Mutex&) = delete;
+    Mutex& operator=(const Mutex&) = delete;
+
+    int lock() { return suspenders_mutex_lock(&m_); }
+    int lock_dl(uint64_t deadline_ns) { return suspenders_mutex_lock_dl(&m_, deadline_ns); }
+    [[nodiscard]] int try_lock() { return suspenders_mutex_trylock(&m_); }
+    int unlock() { return suspenders_mutex_unlock(&m_); }
+    [[nodiscard]] suspenders_mutex_t* native() { return &m_; }
+};
+
+// Scoped lock over suspenders::Mutex.
+class LockGuard {
+    Mutex& m_;
+public:
+    explicit LockGuard(Mutex& m) : m_(m) { (void)m_.lock(); }
+    ~LockGuard() { (void)m_.unlock(); }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+};
+
+class RWLock {
+    suspenders_rwlock_t rw_;
+public:
+    RWLock() { suspenders_rwlock_init(&rw_); }
+    RWLock(const RWLock&) = delete;
+    RWLock& operator=(const RWLock&) = delete;
+
+    int rdlock() { return suspenders_rwlock_rdlock(&rw_); }
+    int rdlock_dl(uint64_t deadline_ns) { return suspenders_rwlock_rdlock_dl(&rw_, deadline_ns); }
+    [[nodiscard]] int try_rdlock() { return suspenders_rwlock_tryrdlock(&rw_); }
+    int wrlock() { return suspenders_rwlock_wrlock(&rw_); }
+    int wrlock_dl(uint64_t deadline_ns) { return suspenders_rwlock_wrlock_dl(&rw_, deadline_ns); }
+    [[nodiscard]] int try_wrlock() { return suspenders_rwlock_trywrlock(&rw_); }
+    int unlock() { return suspenders_rwlock_unlock(&rw_); }
+    [[nodiscard]] suspenders_rwlock_t* native() { return &rw_; }
+};
+
+class Cond {
+    suspenders_cond_t c_;
+public:
+    Cond() { suspenders_cond_init(&c_); }
+    Cond(const Cond&) = delete;
+    Cond& operator=(const Cond&) = delete;
+
+    int wait(Mutex& m) { return suspenders_cond_wait(&c_, m.native()); }
+    int wait_dl(Mutex& m, uint64_t deadline_ns) {
+        return suspenders_cond_wait_dl(&c_, m.native(), deadline_ns);
+    }
+    int signal() { return suspenders_cond_signal(&c_); }
+    int broadcast() { return suspenders_cond_broadcast(&c_); }
+    [[nodiscard]] suspenders_cond_t* native() { return &c_; }
+};
+
+class WaitGroup {
+    suspenders_waitgroup_t wg_;
+public:
+    WaitGroup() { suspenders_waitgroup_init(&wg_); }
+    WaitGroup(const WaitGroup&) = delete;
+    WaitGroup& operator=(const WaitGroup&) = delete;
+
+    int add(int delta) { return suspenders_waitgroup_add(&wg_, delta); }
+    int done() { return suspenders_waitgroup_done(&wg_); }
+    int wait() { return suspenders_waitgroup_wait(&wg_); }
+    int wait_dl(uint64_t deadline_ns) { return suspenders_waitgroup_wait_dl(&wg_, deadline_ns); }
+    [[nodiscard]] suspenders_waitgroup_t* native() { return &wg_; }
+};
+
+// RAII cleanup handler: runs at scope exit, or at coroutine exit if the
+// coroutine is canceled/exits mid-scope (via the C cleanup stack).
+class CleanupGuard {
+    suspenders_cleanup_t node_{};
+    std::function<void()> fn_;
+    static void trampoline(void* arg) {
+        auto* self = static_cast<CleanupGuard*>(arg);
+        if (self->fn_) self->fn_();
+    }
+public:
+    template<typename F>
+    explicit CleanupGuard(F&& f) : fn_(std::forward<F>(f)) {
+        suspenders_cleanup_push(&node_, trampoline, this);
+    }
+    ~CleanupGuard() {
+        suspenders_cleanup_pop(0);   // unregister; run from the destructor
+        if (fn_) fn_();
+    }
+    CleanupGuard(const CleanupGuard&) = delete;
+    CleanupGuard& operator=(const CleanupGuard&) = delete;
+    void release() { fn_ = nullptr; }   // disarm: never runs
+};
+
+// ============================================================================
 // Type-Safe Channel (zero-copy rendezvous)
 // ============================================================================
 
@@ -286,9 +384,54 @@ public:
         return std::nullopt;
     }
     
+    // Status-returning variants (SUSPENDERS_OK / CLOSED / FULL / EMPTY / ...)
+    [[nodiscard]] int send_status(const T& value) {
+        return ch_ ? suspenders_chan_send(ch_, const_cast<T*>(&value)) : SUSPENDERS_INVAL;
+    }
+    [[nodiscard]] int recv_status(T& out) {
+        return ch_ ? suspenders_chan_recv(ch_, &out) : SUSPENDERS_INVAL;
+    }
+    [[nodiscard]] int try_send(const T& value) {
+        return ch_ ? suspenders_chan_try_send(ch_, const_cast<T*>(&value)) : SUSPENDERS_INVAL;
+    }
+    [[nodiscard]] int try_recv(T& out) {
+        return ch_ ? suspenders_chan_try_recv(ch_, &out) : SUSPENDERS_INVAL;
+    }
+    [[nodiscard]] int send_dl(const T& value, uint64_t deadline_ns) {
+        return ch_ ? suspenders_chan_send_dl(ch_, const_cast<T*>(&value), deadline_ns)
+                   : SUSPENDERS_INVAL;
+    }
+    [[nodiscard]] int recv_dl(T& out, uint64_t deadline_ns) {
+        return ch_ ? suspenders_chan_recv_dl(ch_, &out, deadline_ns) : SUSPENDERS_INVAL;
+    }
+    int close() {
+        return ch_ ? suspenders_chan_close(ch_) : SUSPENDERS_INVAL;
+    }
+
+    // Select case builders: suspenders::select({ch.recv_op(v), ch2.send_op(x)})
+    [[nodiscard]] suspenders_chan_op_t recv_op(T& out) {
+        return suspenders_chan_op_t{ ch_, &out, false };
+    }
+    [[nodiscard]] suspenders_chan_op_t send_op(T& value) {
+        return suspenders_chan_op_t{ ch_, &value, true };
+    }
+
     [[nodiscard]] size_t element_size() const { return sizeof(T); }
     [[nodiscard]] suspenders_chan_t* native() const { return ch_; }
 };
+
+// Multi-channel select over case builders. Returns the winning case index
+// (suspenders_errno holds OK/CLOSED) or a negative status (TIMEDOUT/...).
+inline int select(std::initializer_list<suspenders_chan_op_t> cases,
+                  uint64_t deadline_ns = 0) {
+    suspenders_chan_op_t ops[SUSPENDERS_SELECT_MAX];
+    int n = 0;
+    for (const auto& op : cases) {
+        if (n >= SUSPENDERS_SELECT_MAX) break;
+        ops[n++] = op;
+    }
+    return suspenders_select_dl(ops, n, deadline_ns);
+}
 
 // ============================================================================
 // Async Hose (transport-agnostic stream abstraction)
@@ -429,6 +572,20 @@ public:
         }
     }
     
+    int shutdown(int how) {
+        return valid_ ? suspenders_hose_shutdown(&suspenders_hose_, how) : SUSPENDERS_INVAL;
+    }
+    int set_option(int level, int optname, const void* optval, socklen_t optlen) {
+        return valid_ ? suspenders_hose_set_option(&suspenders_hose_, level, optname, optval, optlen)
+                      : SUSPENDERS_INVAL;
+    }
+    int peername(struct sockaddr* addr, socklen_t* addrlen) {
+        return valid_ ? suspenders_hose_peername(&suspenders_hose_, addr, addrlen) : SUSPENDERS_INVAL;
+    }
+    int sockname(struct sockaddr* addr, socklen_t* addrlen) {
+        return valid_ ? suspenders_hose_sockname(&suspenders_hose_, addr, addrlen) : SUSPENDERS_INVAL;
+    }
+
     [[nodiscard]] suspenders_sock_t fd() const { return suspenders_hose_.fd; }
     [[nodiscard]] bool valid() const { return valid_ && suspenders_hose_.fd != SUSPENDERS_INVALID_SOCK; }
     [[nodiscard]] suspenders_hose_t* native() { return &suspenders_hose_; }
