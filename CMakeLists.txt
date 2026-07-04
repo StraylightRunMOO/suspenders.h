@@ -138,7 +138,8 @@ target_compile_options(suspenders-bench-cycles PRIVATE -O3)
 
 # C examples
 foreach(example tcp_pingpong tcp_echo udp_echo unix_echo channel_demo
-                suspend_resume_demo thread_pool dispatch_demo event_loop)
+                suspend_resume_demo thread_pool dispatch_demo event_loop
+                pipeline select_mux sync_primitives chat_server timeout_retry)
     add_suspenders_executable(${example} examples/${example}.c)
 endforeach()
 
@@ -156,6 +157,9 @@ add_suspenders_cc_executable(simple_cc examples/simple.cc)
 add_suspenders_cc_executable(thread_pool_cc examples/thread_pool.cc)
 add_suspenders_cc_executable(dispatch_demo_cc examples/dispatch_demo.cc)
 add_suspenders_cc_executable(event_loop_cc examples/event_loop.cc)
+add_suspenders_cc_executable(pipeline_cc examples/pipeline.cc)
+add_suspenders_cc_executable(chat_server_cc examples/chat_server.cc)
+add_suspenders_cc_executable(scatter_gather_cc examples/scatter_gather.cc)
 
 # Install: headers + pkg-config (header-only library)
 include(GNUInstallDirs)
