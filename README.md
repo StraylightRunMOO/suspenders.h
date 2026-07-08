@@ -3,12 +3,7 @@
 A high-performance, header-only C11 library providing stackful coroutines
 (fibers) with sub-100ns context switching, a multi-worker QoS scheduler,
 Go-style channels with `select`, libdispatch-style task queues, and
-io_uring-backed async I/O ("hoses").
-
-Design goals for v1.0: feature parity with [neco], performance in libuv's
-class, ergonomics like libdispatch — in one header.
-
-[neco]: https://github.com/tidwall/neco
+io_uring-backed async I/O ("hoses")
 
 ## Measured performance
 
