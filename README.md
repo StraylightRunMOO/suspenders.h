@@ -36,12 +36,18 @@ gives exact counts.
 
 ## Requirements
 
-- Linux x86_64 or aarch64 (first-class; io_uring backend)
-- kqueue (macOS/BSD), poll (generic POSIX), and WSAPoll (Windows) backends
-  are kept compiling; the poll backend is exercised in CI via a forced-poll
-  test target, the others are secondary
-- GCC or Clang with C11 (`_GNU_SOURCE` is required on Linux)
-- liburing 2.0+ (implementation TU only — consumers of the header don't need it)
+- Linux x86_64 or aarch64 (first-class). The io_uring backend is used when the
+  kernel is **≥ 5.19**; older kernels (e.g. 5.15 LTS) fall back to poll at
+  init. Force poll anytime with `-DSUSPENDERS_FORCE_POLL` /
+  `suspenders-tests-poll`.
+- kqueue (macOS/BSD), poll (generic POSIX), and WSAPoll (Windows) backends.
+  Windows is single-worker (WSAPoll + fibers); multi-worker is POSIX-only.
+- GCC or Clang with C11 (`_GNU_SOURCE` is required on Linux); MSVC C11/C17 OK
+  for the Windows path
+- liburing 2.0+ on Linux (implementation TU only — consumers of the header
+  don't need it)
+- **Memento** v2.2.1+ (FetchContent by default; override with
+  `-DSUSPENDERS_MEMENTO_SOURCE=/path/to/memento`)
 - CMake 3.16+ for the test/benchmark/example tree
 - C++17 for the optional `suspenders.hpp` facade
 
@@ -274,7 +280,7 @@ barrier_async with lambdas; `Queue::global(qos)`), `Hose`, and `Buffer`.
 ## Memory model
 
 All coroutine control blocks, stacks, channels, queues, and tasks are
-allocated through the bundled [Memento](third_party/memento.h) allocator:
+allocated through the [Memento](https://github.com/StraylightRunMOO/memento) allocator (FetchContent v2.2.1+):
 one size-classed heap per thread, an arena per coroutine stack, and a
 lock-free MPSC return path for cross-thread frees (a worker freeing another
 worker's memory pushes it to the owner's heap, which flushes when idle).

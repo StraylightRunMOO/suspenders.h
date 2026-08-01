@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(libsuspenders VERSION 1.0.0 LANGUAGES C CXX)
+project(libsuspenders VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -11,6 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(SUSPENDERS_WERROR "Treat warnings as errors" ON)
 set(SUSPENDERS_SANITIZE "off" CACHE STRING
     "Sanitizer: off, address, undefined, address,undefined, or thread")
+set(SUSPENDERS_MEMENTO_SOURCE "" CACHE PATH
+    "Optional local Memento source tree (uses include/memento.h). Empty = FetchContent v2.2.1.")
 
 # Compiler flags
 if(MSVC)
@@ -30,6 +32,35 @@ if(NOT SUSPENDERS_SANITIZE STREQUAL "off")
     add_link_options(-fsanitize=${SUSPENDERS_SANITIZE})
     message(STATUS "Sanitizers enabled: ${SUSPENDERS_SANITIZE}")
 endif()
+
+# ---------------------------------------------------------------------------
+# Memento (header-only) — FetchContent v2.2.1, or local tree override.
+# Use Populate (not MakeAvailable) so we only take the header; memento's own
+# CMake tests/examples stay out of this project's ctest graph, and we avoid
+# its BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include path (wrong when nested).
+# ---------------------------------------------------------------------------
+include(FetchContent)
+if(SUSPENDERS_MEMENTO_SOURCE)
+    if(NOT EXISTS "${SUSPENDERS_MEMENTO_SOURCE}/include/memento.h")
+        message(FATAL_ERROR
+            "SUSPENDERS_MEMENTO_SOURCE=${SUSPENDERS_MEMENTO_SOURCE} has no include/memento.h")
+    endif()
+    set(memento_SOURCE_DIR "${SUSPENDERS_MEMENTO_SOURCE}")
+    message(STATUS "Memento: local ${memento_SOURCE_DIR}")
+else()
+    FetchContent_Declare(
+        memento
+        GIT_REPOSITORY https://github.com/StraylightRunMOO/memento.git
+        GIT_TAG        v2.2.1
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_GetProperties(memento)
+    if(NOT memento_POPULATED)
+        FetchContent_Populate(memento)
+    endif()
+    message(STATUS "Memento: FetchContent v2.2.1 -> ${memento_SOURCE_DIR}")
+endif()
+set(MEMENTO_INCLUDE_DIR "${memento_SOURCE_DIR}/include")
 
 # Platform-specific setup
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -74,8 +105,10 @@ endif()
 find_package(Threads REQUIRED)
 find_library(MATH_LIBRARY m)
 
-# Common include directories
-set(SUSPENDERS_INCLUDE_DIRS include third_party)
+# Common include directories (memento is third-party: SYSTEM quiets its -Wunused
+# under our -Werror; still need a non-SYSTEM path so #include "memento.h" works
+# when consumers build without SYSTEM).
+set(SUSPENDERS_INCLUDE_DIRS include)
 if(LIBURING_FOUND)
     list(APPEND SUSPENDERS_INCLUDE_DIRS ${LIBURING_INCLUDE_DIRS})
 endif()
@@ -93,6 +126,7 @@ endif()
 function(add_suspenders_executable name source)
     add_executable(${name} ${source})
     target_include_directories(${name} PRIVATE ${SUSPENDERS_INCLUDE_DIRS})
+    target_include_directories(${name} SYSTEM PRIVATE "${MEMENTO_INCLUDE_DIR}")
     target_link_libraries(${name} PRIVATE ${SUSPENDERS_LINK_LIBS})
     if(LIBURING_CFLAGS_OTHER)
         target_compile_options(${name} PRIVATE ${LIBURING_CFLAGS_OTHER})
@@ -147,6 +181,7 @@ endforeach()
 function(add_suspenders_cc_executable name source)
     add_executable(${name} ${source})
     target_include_directories(${name} PRIVATE ${SUSPENDERS_INCLUDE_DIRS})
+    target_include_directories(${name} SYSTEM PRIVATE "${MEMENTO_INCLUDE_DIR}")
     target_link_libraries(${name} PRIVATE ${SUSPENDERS_LINK_LIBS})
     if(LIBURING_CFLAGS_OTHER)
         target_compile_options(${name} PRIVATE ${LIBURING_CFLAGS_OTHER})
@@ -165,8 +200,12 @@ add_suspenders_cc_executable(scatter_gather_cc examples/scatter_gather.cc)
 include(GNUInstallDirs)
 install(FILES include/suspenders.h include/suspenders.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES third_party/memento.h
+install(FILES "${MEMENTO_INCLUDE_DIR}/memento.h"
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/suspenders)
+if(EXISTS "${MEMENTO_INCLUDE_DIR}/memento.hpp")
+    install(FILES "${MEMENTO_INCLUDE_DIR}/memento.hpp"
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/suspenders)
+endif()
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/suspenders.pc.in"
     "${CMAKE_CURRENT_BINARY_DIR}/suspenders.pc"
@@ -181,8 +220,9 @@ message(STATUS "  Version:        ${PROJECT_VERSION}")
 message(STATUS "  C Compiler:     ${CMAKE_C_COMPILER}")
 message(STATUS "  Platform:       ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Sanitizers:     ${SUSPENDERS_SANITIZE}")
+message(STATUS "  Memento:        ${MEMENTO_INCLUDE_DIR}")
 if(LIBURING_FOUND)
-    message(STATUS "  Backend:        io_uring (${LIBURING_LIBRARIES})")
+    message(STATUS "  Backend:        io_uring (runtime: poll if kernel < 5.19) (${LIBURING_LIBRARIES})")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "BSD")
     message(STATUS "  Backend:        kqueue")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
