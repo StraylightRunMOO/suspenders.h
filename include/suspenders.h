@@ -7,8 +7,8 @@
  * ============================================================================ */
 #define SUSPENDERS_VERSION_MAJOR 1
 #define SUSPENDERS_VERSION_MINOR 1
-#define SUSPENDERS_VERSION_PATCH 0
-#define SUSPENDERS_VERSION "1.1.0"
+#define SUSPENDERS_VERSION_PATCH 1
+#define SUSPENDERS_VERSION "1.1.1"
 #define SUSPENDERS_VERSION_NUMBER \
     (SUSPENDERS_VERSION_MAJOR * 10000 + SUSPENDERS_VERSION_MINOR * 100 + SUSPENDERS_VERSION_PATCH)
 
@@ -870,7 +870,16 @@ static SUSPENDERS_TLS suspenders_cr_t *ready_queue_heads[SUSPENDERS_QOS_COUNT] =
 static SUSPENDERS_TLS suspenders_cr_t *ready_queue_tails[SUSPENDERS_QOS_COUNT] = {0};
 static SUSPENDERS_TLS suspenders_cr_t *s_zombies = NULL;   /* crs are pinned: exit is local */
 static SUSPENDERS_TLS suspenders_cr_t *s_live_crs = NULL;  /* pinned, unfinished crs (owner thread) */
+/* Per-thread "this thread is a scheduler worker / init thread" flag: set by
+ * suspenders_init (worker 0) and helper worker entry, checked by
+ * suspenders_run / suspenders_shutdown (must run on the init thread). */
 static SUSPENDERS_TLS int suspenders_initialized = 0;
+/* Process-global "runtime is up" flag: spawn / queue_create /
+ * get_global_queue are safe from foreign threads once init returns, so they
+ * must not consult the TLS flag (which is 0 on threads that never called
+ * init). Cleared at the start of shutdown so concurrent foreign spawns fail
+ * cleanly with NOTINIT rather than racing teardown. */
+static suspenders_atomic_int s_runtime_up = 0;
 static suspenders_atomic_int active_coroutines = 0;
 static suspenders_atomic_uintptr_t suspenders_next_id = 1;
 /* Tasks submitted to queues but not yet finished. Daemon drainers are not
@@ -1876,7 +1885,8 @@ int suspenders_deadline(uint64_t deadline_ns) {
 
 static suspenders_cr_t* s_spawn_impl(void (*func)(void*), void *arg,
                                      suspenders_qos_t qos, bool daemon) {
-    if (SUSPENDERS_UNLIKELY(!suspenders_initialized)) {
+    if (SUSPENDERS_UNLIKELY(!suspenders_atomic_load(s_runtime_up,
+                                                    SUSPENDERS_MEMORY_ORDER_ACQUIRE))) {
         suspenders_errno = SUSPENDERS_NOTINIT;
         return NULL;
     }
@@ -4574,7 +4584,8 @@ static void s_queue_drainer(void *arg) {
 suspenders_queue_t* suspenders_queue_create(const char *label,
                                             suspenders_qos_t qos,
                                             unsigned concurrency) {
-    if (SUSPENDERS_UNLIKELY(!suspenders_initialized)) {
+    if (SUSPENDERS_UNLIKELY(!suspenders_atomic_load(s_runtime_up,
+                                                    SUSPENDERS_MEMORY_ORDER_ACQUIRE))) {
         suspenders_errno = SUSPENDERS_NOTINIT;
         return NULL;
     }
@@ -4623,7 +4634,8 @@ suspenders_queue_t* suspenders_queue_create(const char *label,
 }
 
 suspenders_queue_t* suspenders_get_global_queue(suspenders_qos_t qos) {
-    if (SUSPENDERS_UNLIKELY(!suspenders_initialized)) {
+    if (SUSPENDERS_UNLIKELY(!suspenders_atomic_load(s_runtime_up,
+                                                    SUSPENDERS_MEMORY_ORDER_ACQUIRE))) {
         suspenders_errno = SUSPENDERS_NOTINIT;
         return NULL;
     }
@@ -5169,7 +5181,7 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
         suspenders_atomic_init(w->parked, 0);
         if (!s_wake_fd_create(w)) {
             for (unsigned j = 0; j < i; j++) s_wake_fd_destroy(&s_workers[j]);
-            #if defined(_MSC_VER)
+            #ifdef SUSPENDERS_PLATFORM_WINDOWS
             _aligned_free(s_workers);
             #else
             free(s_workers);
@@ -5206,7 +5218,7 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
                 pthread_join(s_workers[j].thread, NULL);
             }
             for (unsigned j = 0; j < num_workers; j++) s_wake_fd_destroy(&s_workers[j]);
-            #if defined(_MSC_VER)
+            #ifdef SUSPENDERS_PLATFORM_WINDOWS
             _aligned_free(s_workers);
             #else
             free(s_workers);
@@ -5224,6 +5236,7 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
 #endif
 
     suspenders_initialized = 1;
+    suspenders_atomic_store(s_runtime_up, 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
     return SUSPENDERS_OK;
 }
 
@@ -5245,6 +5258,9 @@ void suspenders_run(void) {
 void suspenders_shutdown(void) {
     if (!suspenders_initialized) return;
 
+    /* Publish "runtime down" before tearing anything: foreign-thread spawn
+     * and queue_create consult s_runtime_up, not this thread's TLS flag. */
+    suspenders_atomic_store(s_runtime_up, 0, SUSPENDERS_MEMORY_ORDER_RELEASE);
     suspenders_atomic_store(s_stop, 1, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
 #ifndef SUSPENDERS_PLATFORM_WINDOWS
     for (unsigned i = 1; i < s_num_workers; i++) {
@@ -5299,7 +5315,7 @@ void suspenders_shutdown(void) {
     }
     if (s_workers) {
         for (unsigned i = 0; i < s_num_workers; i++) s_wake_fd_destroy(&s_workers[i]);
-        #if defined(_MSC_VER)
+        #ifdef SUSPENDERS_PLATFORM_WINDOWS
         _aligned_free(s_workers);
         #else
         free(s_workers);

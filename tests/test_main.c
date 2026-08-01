@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define MEMENTO_IMPLEMENTATION
 #include "memento.h"
@@ -1855,7 +1856,62 @@ static int test_mw_shutdown_busy(void) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Test 42: serial queue runs tasks in strict submission order               */
+/* Test 42: suspenders_spawn from a foreign (non-scheduler) thread            */
+/* -------------------------------------------------------------------------- */
+/* README / API claim spawn is safe from any thread. The ready-queue path
+ * uses TLS, but foreign spawns must go through the global injector and
+ * must not fail with NOTINIT just because suspenders_initialized is TLS
+ * and was never set on this thread. */
+static _Atomic int foreign_spawn_ran = 0;
+static suspenders_cr_t *_Atomic foreign_spawn_cr = NULL;
+static _Atomic int foreign_spawn_errno = 0;
+
+static void foreign_spawn_cr_fn(void *arg) {
+    (void)arg;
+    atomic_fetch_add(&foreign_spawn_ran, 1);
+}
+
+static void *foreign_spawn_thread(void *arg) {
+    (void)arg;
+    suspenders_cr_t *cr = suspenders_spawn(foreign_spawn_cr_fn, NULL,
+                                           SUSPENDERS_QOS_NORMAL);
+    atomic_store(&foreign_spawn_cr, cr);
+    if (!cr) atomic_store(&foreign_spawn_errno, suspenders_errno);
+    return NULL;
+}
+
+static int test_foreign_thread_spawn(void) {
+    foreign_spawn_ran = 0;
+    foreign_spawn_cr = NULL;
+    foreign_spawn_errno = 0;
+
+    suspenders_init(st_workers(), 256);
+
+    pthread_t th;
+    ASSERT_EQ_INT(0, pthread_create(&th, NULL, foreign_spawn_thread, NULL));
+    ASSERT_EQ_INT(0, pthread_join(th, NULL));
+
+    suspenders_cr_t *cr = atomic_load(&foreign_spawn_cr);
+    ASSERT_NOT_NULL(cr);
+    ASSERT_EQ_INT(0, atomic_load(&foreign_spawn_errno));
+
+    suspenders_run();
+    suspenders_shutdown();
+
+    ASSERT_EQ_INT(1, atomic_load(&foreign_spawn_ran));
+
+    /* After shutdown, foreign spawn must fail with NOTINIT (not crash). */
+    foreign_spawn_cr = NULL;
+    foreign_spawn_errno = 0;
+    ASSERT_EQ_INT(0, pthread_create(&th, NULL, foreign_spawn_thread, NULL));
+    ASSERT_EQ_INT(0, pthread_join(th, NULL));
+    ASSERT_NULL(atomic_load(&foreign_spawn_cr));
+    ASSERT_EQ_INT(SUSPENDERS_NOTINIT, atomic_load(&foreign_spawn_errno));
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 43: serial queue runs tasks in strict submission order               */
 /* -------------------------------------------------------------------------- */
 #define Q_SERIAL_N 32
 static _Atomic int q_order_idx = 0;
@@ -2281,6 +2337,7 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_mw_mutex),
     ST_TEST(test_mw_select),
     ST_TEST(test_mw_shutdown_busy),
+    ST_TEST(test_foreign_thread_spawn),
     ST_TEST(test_queue_serial_order),
     ST_TEST(test_queue_concurrent),
     ST_TEST(test_queue_barrier),

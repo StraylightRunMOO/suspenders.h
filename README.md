@@ -308,8 +308,12 @@ size headers on blocks.
    Memento included first.
 2. Coroutines don't run until `suspenders_run()`.
 3. Channel/blocking calls outside a coroutine return `SUSPENDERS_PERM` —
-   only `suspenders_resume`/`suspenders_cancel`/spawn are thread-safe entry
-   points from foreign threads.
+   only `suspenders_resume`/`suspenders_cancel`/`suspenders_spawn` (and
+   `suspenders_go`) are thread-safe entry points from foreign threads.
+   Foreign spawns land on the global injector and pin to the first worker
+   that runs them. `suspenders_init` / `run` / `shutdown` stay on one
+   thread; `shutdown` also tears down Memento (`memento_shutdown`), so
+   drop any other Memento-backed jobs first.
 4. Default stack is 1 MB per coroutine; avoid deep recursion.
 5. Call `suspenders_shutdown()` from the thread that called
    `suspenders_init()`, after `run()` returns.

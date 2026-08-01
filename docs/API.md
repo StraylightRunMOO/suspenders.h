@@ -212,13 +212,20 @@ suspenders_cr_t* suspenders_spawn(void (*func)(void*), void *arg, suspenders_qos
 
 Create a coroutine that will call `func(arg)` at priority `qos`. The
 coroutine doesn't run immediately — it's placed in the ready queue (or the
-global injector, if spawned from outside a coroutine).
+global injector, if spawned from outside a coroutine / from a foreign
+thread).
+
+Safe from any thread after a successful `suspenders_init` (including
+threads that never called init). Foreign-thread spawns always go through
+the global injector. `suspenders_run` / `suspenders_shutdown` must still
+run on the init thread.
 
 Coroutines pin to the first worker that runs them. After that, all their
 work happens on that worker. Cross-worker wakes (from `resume`, channels,
 etc.) route through an MPSC inbox.
 
-**Returns** a pointer to the coroutine, or `NULL` on failure.
+**Returns** a pointer to the coroutine, or `NULL` on failure
+(`SUSPENDERS_NOTINIT` if the runtime is down, `SUSPENDERS_NOMEM` on OOM).
 
 ### suspenders_go()
 
