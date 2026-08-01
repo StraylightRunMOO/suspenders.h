@@ -2087,6 +2087,155 @@ static int test_queue_destroy_global(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Loop smoke: listener + per-conn hose I/O + timers + channels               */
+/* Regression for the pre-1.1 io_uring lost-wakeup hang (SUSPENDERS_FIX.md).  */
+/* -------------------------------------------------------------------------- */
+#define LOOP_SMOKE_PORT 14043
+#define LOOP_SMOKE_CLIENTS 4
+#define LOOP_SMOKE_PULSES 8
+
+static _Atomic int ls_ready = 0;
+static _Atomic int ls_done_clients = 0;
+static _Atomic int ls_pulses = 0;
+static _Atomic int ls_fail = 0;
+static suspenders_chan_t *ls_chan = NULL;
+
+static void ls_pulse_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < LOOP_SMOKE_PULSES; i++) {
+        suspenders_sleep_ns(2 * 1000 * 1000ULL); /* 2 ms */
+        int v = i;
+        if (ls_chan && suspenders_chan_send(ls_chan, &v) != SUSPENDERS_OK) {
+            ls_fail = 1;
+            return;
+        }
+        ls_pulses++;
+    }
+}
+
+static void ls_chan_consumer_cr(void *arg) {
+    (void)arg;
+    int got = 0;
+    while (got < LOOP_SMOKE_PULSES) {
+        int v = -1;
+        if (suspenders_chan_recv(ls_chan, &v) != SUSPENDERS_OK) {
+            ls_fail = 1;
+            return;
+        }
+        got++;
+    }
+}
+
+static void ls_conn_cr(void *arg) {
+    suspenders_hose_t *client = (suspenders_hose_t *)arg;
+    char buf[64];
+    for (;;) {
+        ssize_t n = suspenders_hose_read(client, buf, sizeof(buf));
+        if (n <= 0) break;
+        /* Echo + short timer between ops (mixes timer heap with I/O). */
+        suspenders_sleep_ns(500 * 1000ULL);
+        if (suspenders_hose_write(client, buf, (size_t)n) < 0) {
+            ls_fail = 1;
+            break;
+        }
+        if (n >= 4 && memcmp(buf, "quit", 4) == 0) break;
+    }
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
+}
+
+static void ls_server_cr(void *arg) {
+    (void)arg;
+    suspenders_hose_t listener;
+    suspenders_hose_init(&listener, NULL);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", LOOP_SMOKE_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) {
+        ls_fail = 1;
+        return;
+    }
+    ls_ready = 1;
+
+    for (int i = 0; i < LOOP_SMOKE_CLIENTS; i++) {
+        suspenders_hose_t *client = memento_thread_heap_alloc(
+            memento_thread_heap_get(), sizeof(suspenders_hose_t));
+        if (!client) { ls_fail = 1; break; }
+        suspenders_hose_init(client, NULL);
+        /* Accept with a generous deadline so a hung backend fails the test. */
+        if (!suspenders_hose_accept_dl(&listener, client, suspenders_now_ns() + 5000000000ULL)) {
+            memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
+            ls_fail = 1;
+            break;
+        }
+        suspenders_spawn(ls_conn_cr, client, SUSPENDERS_QOS_NORMAL);
+    }
+    suspenders_hose_close(&listener);
+}
+
+static void ls_client_cr(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 5000 && !ls_ready; i++)
+        suspenders_sleep_ns(1000000ULL);
+    if (!ls_ready) { ls_fail = 1; return; }
+
+    suspenders_hose_t conn;
+    struct buf b = {0};
+    suspenders_hose_init(&conn, &b);
+    char uri[64];
+    snprintf(uri, sizeof(uri), "tcp://127.0.0.1:%d", LOOP_SMOKE_PORT);
+    if (!suspenders_hose_dial(&conn, uri)) {
+        ls_fail = 1;
+        return;
+    }
+
+    const char *cmds[] = { "look", "north", "quit" };
+    for (size_t c = 0; c < sizeof(cmds) / sizeof(cmds[0]); c++) {
+        size_t len = strlen(cmds[c]);
+        if (suspenders_hose_write(&conn, cmds[c], len) < 0) {
+            ls_fail = 1;
+            break;
+        }
+        char rbuf[64] = {0};
+        ssize_t n = suspenders_hose_read_dl(&conn, rbuf, sizeof(rbuf) - 1,
+                                            suspenders_now_ns() + 3000000000ULL);
+        if (n <= 0 || (size_t)n != len || memcmp(rbuf, cmds[c], len) != 0) {
+            ls_fail = 1;
+            break;
+        }
+        suspenders_sleep_ns(300 * 1000ULL);
+    }
+    suspenders_hose_close(&conn);
+    ls_done_clients++;
+}
+
+static int test_loop_smoke(void) {
+    ls_ready = 0;
+    ls_done_clients = 0;
+    ls_pulses = 0;
+    ls_fail = 0;
+
+    suspenders_init(st_workers(), 256);
+    ls_chan = suspenders_chan_create(sizeof(int), 8);
+    ASSERT_NOT_NULL(ls_chan);
+
+    suspenders_spawn(ls_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(ls_pulse_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_spawn(ls_chan_consumer_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    for (int i = 0; i < LOOP_SMOKE_CLIENTS; i++)
+        suspenders_spawn(ls_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
+
+    suspenders_run();
+    suspenders_chan_destroy(ls_chan);
+    ls_chan = NULL;
+    suspenders_shutdown();
+
+    ASSERT_EQ_INT(0, ls_fail);
+    ASSERT_EQ_INT(LOOP_SMOKE_CLIENTS, ls_done_clients);
+    ASSERT_EQ_INT(LOOP_SMOKE_PULSES, ls_pulses);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 static const st_test_t st_tests[] = {
@@ -2137,6 +2286,7 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_queue_barrier),
     ST_TEST(test_queue_sync_after),
     ST_TEST(test_queue_destroy_global),
+    ST_TEST(test_loop_smoke),
 };
 
 int main(int argc, char **argv) {

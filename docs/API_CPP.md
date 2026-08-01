@@ -1,6 +1,6 @@
 # Suspenders C++ API Reference
 
-*libsuspenders 1.0 — the C++17 wrapper: RAII, lambdas, type-safe channels.*
+*libsuspenders 1.1 — the C++17 wrapper: RAII, lambdas, type-safe channels.*
 
 This is the reference for `suspenders.hpp`, the C++ facade. It wraps the
 entire [C API](API.md) in move-only RAII types, replaces `void*` callbacks

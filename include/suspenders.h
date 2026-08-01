@@ -6,9 +6,9 @@
  * Version
  * ============================================================================ */
 #define SUSPENDERS_VERSION_MAJOR 1
-#define SUSPENDERS_VERSION_MINOR 0
+#define SUSPENDERS_VERSION_MINOR 1
 #define SUSPENDERS_VERSION_PATCH 0
-#define SUSPENDERS_VERSION "1.0.0"
+#define SUSPENDERS_VERSION "1.1.0"
 #define SUSPENDERS_VERSION_NUMBER \
     (SUSPENDERS_VERSION_MAJOR * 10000 + SUSPENDERS_VERSION_MINOR * 100 + SUSPENDERS_VERSION_PATCH)
 
@@ -45,7 +45,12 @@
 #endif
 #define SUSPENDERS_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define SUSPENDERS_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define SUSPENDERS_CACHELINE   64
+/* Apple Silicon uses 128-byte cache lines; x86_64 / most ARM Linux use 64. */
+#if defined(__APPLE__) && defined(__aarch64__)
+    #define SUSPENDERS_CACHELINE 128
+#else
+    #define SUSPENDERS_CACHELINE 64
+#endif
 
 /* ============================================================================
  * Atomic abstraction - C11 _Atomic in C, std::atomic in C++
@@ -117,19 +122,43 @@ typedef _Atomic uintptr_t          suspenders_atomic_uintptr_t;
     #define SUSPENDERS_ARCH_AARCH64 1
 #endif
 
-/* Backend selection (SUSPENDERS_FORCE_POLL pins the portable poll backend,
- * mainly to keep it verified on Linux CI) */
+/* Backend selection.
+ * SUSPENDERS_FORCE_POLL pins the portable poll backend (CI verification).
+ * On Linux we compile both io_uring and poll: init probes the kernel and
+ * falls back to poll on pre-5.19 kernels (lost CQE wakeup / no COOP_TASKRUN).
+ * SUSPENDERS_HAS_* = compile the path; runtime be->type selects which runs. */
 #if defined(SUSPENDERS_FORCE_POLL)
-    #define SUSPENDERS_BACKEND_POLL 1
+    #define SUSPENDERS_HAS_IOURING 0
+    #define SUSPENDERS_HAS_KQUEUE  0
+    #define SUSPENDERS_HAS_POLL    1
+    #define SUSPENDERS_HAS_WSAPOLL 0
 #elif SUSPENDERS_PLATFORM_LINUX
-    #define SUSPENDERS_BACKEND_IOURING 1
+    #define SUSPENDERS_HAS_IOURING 1
+    #define SUSPENDERS_HAS_KQUEUE  0
+    #define SUSPENDERS_HAS_POLL    1   /* fallback when io_uring is unsafe */
+    #define SUSPENDERS_HAS_WSAPOLL 0
 #elif SUSPENDERS_PLATFORM_BSD
-    #define SUSPENDERS_BACKEND_KQUEUE 1
+    #define SUSPENDERS_HAS_IOURING 0
+    #define SUSPENDERS_HAS_KQUEUE  1
+    #define SUSPENDERS_HAS_POLL    0
+    #define SUSPENDERS_HAS_WSAPOLL 0
 #elif SUSPENDERS_PLATFORM_WINDOWS
-    #define SUSPENDERS_BACKEND_WSAPOLL 1
+    #define SUSPENDERS_HAS_IOURING 0
+    #define SUSPENDERS_HAS_KQUEUE  0
+    #define SUSPENDERS_HAS_POLL    0
+    #define SUSPENDERS_HAS_WSAPOLL 1
 #else
-    #define SUSPENDERS_BACKEND_POLL 1
+    #define SUSPENDERS_HAS_IOURING 0
+    #define SUSPENDERS_HAS_KQUEUE  0
+    #define SUSPENDERS_HAS_POLL    1
+    #define SUSPENDERS_HAS_WSAPOLL 0
 #endif
+
+/* Legacy aliases used in a few residual checks */
+#define SUSPENDERS_BACKEND_IOURING SUSPENDERS_HAS_IOURING
+#define SUSPENDERS_BACKEND_KQUEUE  SUSPENDERS_HAS_KQUEUE
+#define SUSPENDERS_BACKEND_POLL    SUSPENDERS_HAS_POLL
+#define SUSPENDERS_BACKEND_WSAPOLL SUSPENDERS_HAS_WSAPOLL
 
 /* ============================================================================
  * Platform Headers
@@ -141,6 +170,7 @@ typedef _Atomic uintptr_t          suspenders_atomic_uintptr_t;
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <windows.h>
+    #include <malloc.h>   /* _aligned_malloc / _aligned_free */
     /* Windows has no <sys/uio.h>; provide the iovec shape used by the
      * transport vtable (readv/writev return ENOTSUP there). */
     struct iovec { void *iov_base; size_t iov_len; };
@@ -405,12 +435,20 @@ static inline void suspenders_ticket_init(suspenders_ticket_lock_t *l) {
 static inline void suspenders_ticket_lock(suspenders_ticket_lock_t *l) {
     uint32_t my_ticket = suspenders_atomic_fetch_add(l->next_ticket, 1,
                                                     SUSPENDERS_MEMORY_ORDER_RELAXED);
+    unsigned spins = 0;
     while (suspenders_atomic_load(l->now_serving, SUSPENDERS_MEMORY_ORDER_ACQUIRE) != my_ticket) {
+        /* Exponential pause backoff cuts bus traffic under high contention. */
+        unsigned n = spins < 6 ? (1u << spins) : 64u;
+        for (unsigned i = 0; i < n; i++) {
 #if defined(SUSPENDERS_ARCH_X86_64)
-        __builtin_ia32_pause();
+            __builtin_ia32_pause();
 #elif defined(SUSPENDERS_ARCH_AARCH64)
-        __asm__ volatile("yield" ::: "memory");
+            __asm__ volatile("yield" ::: "memory");
+#else
+            /* no-op pause on other arches */
 #endif
+        }
+        if (spins < 10) spins++;
     }
 }
 
@@ -781,7 +819,7 @@ void  suspenders_hose_close(suspenders_hose_t *d);
 #include <stdlib.h>
 #include <stdio.h>
 
-#if SUSPENDERS_BACKEND_IOURING
+#if SUSPENDERS_HAS_IOURING
     #include <liburing.h>
 #endif
 
@@ -796,6 +834,7 @@ void  suspenders_hose_close(suspenders_hose_t *d);
 #endif
 #if SUSPENDERS_PLATFORM_LINUX
     #include <sys/eventfd.h>
+    #include <sys/utsname.h>   /* kernel version probe for io_uring reliability */
 #endif
 
 /* Thread-local detailed error */
@@ -2763,23 +2802,27 @@ int suspenders_waitgroup_wait(suspenders_waitgroup_t *wg) {
 
 /* ============================================================================
  * EVENT BACKEND IMPLEMENTATIONS
+ *
+ * Linux compiles both io_uring and poll. Init probes the kernel: io_uring is
+ * used only when wakeups are reliable (kernel >= 5.19 / COOP_TASKRUN era);
+ * otherwise we fall back to poll. See SUSPENDERS_FIX.md / v1.1 notes.
  * ============================================================================ */
 
 /* Backend struct definition */
 struct suspenders_backend_s {
     int type;
     union {
-#if SUSPENDERS_BACKEND_IOURING
+#if SUSPENDERS_HAS_IOURING
         struct io_uring ring;
 #endif
-#if SUSPENDERS_BACKEND_KQUEUE
+#if SUSPENDERS_HAS_KQUEUE
         struct {
             int kq;
             struct kevent *events;
             int events_cap;
         } kqueue;
 #endif
-#if SUSPENDERS_BACKEND_WSAPOLL || SUSPENDERS_BACKEND_POLL
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
         struct {
             struct pollfd *fds;
             suspenders_cr_t **crs;
@@ -2799,21 +2842,29 @@ struct suspenders_backend_s {
 /* Backend API */
 static suspenders_backend_t* s_backend_create(unsigned hint);
 static void s_backend_destroy(suspenders_backend_t *be);
-#if !SUSPENDERS_BACKEND_IOURING
 static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr);
 static void s_backend_unregister(suspenders_backend_t *be, suspenders_sock_t fd);
-#endif
 static int s_backend_wait(suspenders_backend_t *be, int timeout_ms);
+
+static inline bool s_backend_is_iouring(void) {
+#if SUSPENDERS_HAS_IOURING
+    return suspenders_backend && suspenders_backend->type == SUSPENDERS_BE_IOURING;
+#else
+    return false;
+#endif
+}
 
 /* In-flight completion-mode I/O op, stack-resident in the waiting coroutine
  * and used as the CQE user_data. NULL user_data marks helper SQEs
  * (link-timeout, async-cancel) whose CQEs are skipped: a coroutine is woken
- * by exactly one CQE — its op's own. */
+ * by exactly one CQE — its op's own.
+ * completed/result are atomic so aarch64 visibility is correct if flush and
+ * resume ever race (today same-worker; hardened for the future). */
 typedef struct suspenders_io_op_s {
     suspenders_cr_t *cr;
-    int32_t          result;     /* cqe->res: bytes / fd / -errno */
+    suspenders_atomic_int result;     /* cqe->res: bytes / fd / -errno */
     uint8_t          opcode;
-    bool             completed;
+    suspenders_atomic_int completed;  /* 0/1 */
 } suspenders_io_op_t;
 
 /* Per-op deadline for the next blocking I/O call on this thread, set by the
@@ -2832,19 +2883,34 @@ static uint64_t s_io_effective_deadline(suspenders_cr_t *cr) {
 /* ============================================================================
  * IO_URING BACKEND (completion mode)
  * ============================================================================ */
-#if SUSPENDERS_BACKEND_IOURING
+#if SUSPENDERS_HAS_IOURING
 
 enum {
     S_IOU_RECV, S_IOU_SEND, S_IOU_READV, S_IOU_WRITEV,
     S_IOU_ACCEPT, S_IOU_CONNECT, S_IOU_RECVMSG, S_IOU_SENDMSG
 };
 
-static suspenders_backend_t* s_backend_create(unsigned hint) {
+/* Kernels before 5.19 (pre-COOP_TASKRUN / single-issue-wakeup rework) have
+ * known lost-wakeup races with task_work CQE delivery. Fall back to poll. */
+static bool s_kernel_iouring_reliable(void) {
+    struct utsname u;
+    if (uname(&u) != 0) return false;
+    int major = 0, minor = 0;
+    if (sscanf(u.release, "%d.%d", &major, &minor) < 2) return false;
+    if (major > 5) return true;
+    if (major == 5 && minor >= 19) return true;
+    return false;
+}
+
+static suspenders_backend_t* s_iou_create(unsigned hint) {
     suspenders_backend_t *be = (suspenders_backend_t*)malloc(sizeof(*be));
     if (!be) return NULL;
     memset(be, 0, sizeof(*be));
     be->type = SUSPENDERS_BE_IOURING;
     unsigned flags = 0;
+#ifdef IORING_SETUP_COOP_TASKRUN
+    flags |= IORING_SETUP_COOP_TASKRUN;
+#endif
 #ifdef SUSPENDERS_IOURING_SQPOLL
     /* Experiment, default off: a kernel polling thread per ring eliminates
      * submit syscalls but burns a core per worker — measured slower on
@@ -2853,9 +2919,10 @@ static suspenders_backend_t* s_backend_create(unsigned hint) {
     flags |= IORING_SETUP_SQPOLL;
 #endif
     int ret = io_uring_queue_init(hint, &be->ring, flags);
-#ifdef SUSPENDERS_IOURING_SQPOLL
-    if (ret < 0) ret = io_uring_queue_init(hint, &be->ring, 0);
-#endif
+    if (ret < 0 && flags != 0) {
+        /* Retry without optional flags (old headers/kernels). */
+        ret = io_uring_queue_init(hint, &be->ring, 0);
+    }
     if (ret < 0) {
         free(be);
         return NULL;
@@ -2863,7 +2930,7 @@ static suspenders_backend_t* s_backend_create(unsigned hint) {
     return be;
 }
 
-static void s_backend_destroy(suspenders_backend_t *be) {
+static void s_iou_destroy(suspenders_backend_t *be) {
     if (!be) return;
     io_uring_queue_exit(&be->ring);
     free(be);
@@ -2888,17 +2955,21 @@ static void s_iou_cancel(void *io_op) {
 }
 
 /* Arm (or re-arm) the one-shot readability poll on this worker's wake fd.
- * Its CQE carries the worker's sentinel op (op->cr == NULL). */
+ * Its CQE carries the worker's sentinel op (op->cr == NULL). Eager-submit so
+ * the arm is visible even if the worker stays busy before the next wait. */
 static void s_iou_arm_wake(suspenders_worker_t *w) {
     if (!w || w->wake_rd < 0 || !w->wake_op) return;
     struct io_uring_sqe *sqe = s_iou_get_sqe();
     if (SUSPENDERS_UNLIKELY(!sqe)) return;
     io_uring_prep_poll_add(sqe, (int)w->wake_rd, POLLIN);
     io_uring_sqe_set_data(sqe, w->wake_op);
+    io_uring_submit(&suspenders_backend->ring);
 }
 
 /* Prep + park for one completion-mode op. Callers guarantee a real coroutine
- * context and that entry cancel/deadline checks already ran (s_io_pre). */
+ * context and that entry cancel/deadline checks already ran (s_io_pre).
+ * SQEs are submitted eagerly (after the full linked batch) so a busy worker
+ * cannot leave a blocking op sitting unsubmitted in the SQ ring. */
 static ssize_t s_iou_op(int code, suspenders_sock_t fd,
                         void *buf, size_t len,
                         const struct iovec *iov, int iovcnt,
@@ -2925,7 +2996,12 @@ static ssize_t s_iou_op(int code, suspenders_sock_t fd,
         return -1;
     }
 
-    suspenders_io_op_t op = { cr, 0, (uint8_t)code, false };
+    suspenders_io_op_t op;
+    memset(&op, 0, sizeof(op));
+    op.cr = cr;
+    op.opcode = (uint8_t)code;
+    suspenders_atomic_init(op.result, 0);
+    suspenders_atomic_init(op.completed, 0);
     io_uring_sqe_set_data(sqe, &op);
 
     /* Deadline via linked timeout; the timespec lives on this parked stack. */
@@ -2948,11 +3024,16 @@ static ssize_t s_iou_op(int code, suspenders_sock_t fd,
         }
     }
 
+    /* Eager submit: full linked batch is prepped; do not leave SQEs pending
+     * until the idle wait path (latency + deadlock windows on busy workers). */
+    io_uring_submit(&suspenders_backend->ring);
+
     cr->pending_io = &op;
-    while (!op.completed) suspenders_suspend();
+    while (!suspenders_atomic_load(op.completed, SUSPENDERS_MEMORY_ORDER_ACQUIRE))
+        suspenders_suspend();
     cr->pending_io = NULL;
 
-    int32_t res = op.result;
+    int32_t res = (int32_t)suspenders_atomic_load(op.result, SUSPENDERS_MEMORY_ORDER_ACQUIRE);
     if (SUSPENDERS_UNLIKELY(res < 0)) {
         if (res == -ECANCELED) {
             /* Either suspenders_cancel/deadline via ASYNC_CANCEL, or the
@@ -2986,8 +3067,8 @@ static int s_iou_flush_cqes(suspenders_backend_t *be) {
                 s_iou_arm_wake(s_worker);
                 found++;
             } else {
-                op->result = cqe->res;
-                op->completed = true;
+                suspenders_atomic_store(op->result, cqe->res, SUSPENDERS_MEMORY_ORDER_RELEASE);
+                suspenders_atomic_store(op->completed, 1, SUSPENDERS_MEMORY_ORDER_RELEASE);
                 if (op->cr->state == SUSPENDERS_STATE_SUSPENDED) {
                     suspenders_ready_enqueue(op->cr);
                 }
@@ -3000,7 +3081,7 @@ static int s_iou_flush_cqes(suspenders_backend_t *be) {
     return found;
 }
 
-static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
+static int s_iou_wait(suspenders_backend_t *be, int timeout_ms) {
     io_uring_submit(&be->ring);
 
     int found = s_iou_flush_cqes(be);
@@ -3020,12 +3101,14 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
     return found;
 }
 
+#endif /* SUSPENDERS_HAS_IOURING */
+
 /* ============================================================================
  * KQUEUE BACKEND
  * ============================================================================ */
-#elif SUSPENDERS_BACKEND_KQUEUE
+#if SUSPENDERS_HAS_KQUEUE
 
-static suspenders_backend_t* s_backend_create(unsigned hint) {
+static suspenders_backend_t* s_kq_create(unsigned hint) {
     (void)hint;
     suspenders_backend_t *be = (suspenders_backend_t*)malloc(sizeof(*be));
     if (!be) return NULL;
@@ -3046,14 +3129,14 @@ static suspenders_backend_t* s_backend_create(unsigned hint) {
     return be;
 }
 
-static void s_backend_destroy(suspenders_backend_t *be) {
+static void s_kq_destroy(suspenders_backend_t *be) {
     if (!be) return;
     if (be->kqueue.kq >= 0) close(be->kqueue.kq);
     free(be->kqueue.events);
     free(be);
 }
 
-static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr) {
+static int s_kq_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr) {
     struct kevent ev[2];
     int nev = 0;
     if (events & POLLIN) {
@@ -3066,19 +3149,13 @@ static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, ui
     return kevent(be->kqueue.kq, ev, nev, NULL, 0, NULL);
 }
 
-static void s_backend_unregister(suspenders_backend_t *be, suspenders_sock_t fd) {
+static void s_kq_unregister(suspenders_backend_t *be, suspenders_sock_t fd) {
     (void)be;
     (void)fd;
-    /* EV_ONESHOT auto-deletes after trigger. If we need explicit delete before trigger:
-     * struct kevent ev[2];
-     * EV_SET(&ev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-     * EV_SET(&ev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-     * kevent(be->kqueue.kq, ev, 2, NULL, 0, NULL);
-     * For now, one-shot semantics are sufficient.
-     */
+    /* EV_ONESHOT auto-deletes after trigger. */
 }
 
-static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
+static int s_kq_wait(suspenders_backend_t *be, int timeout_ms) {
     struct timespec ts;
     struct timespec *tsp = NULL;
     if (timeout_ms >= 0) {
@@ -3097,23 +3174,25 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
         } else if (s_worker) {
             /* Worker wake fd (registered one-shot): drain and re-arm. */
             s_wake_drain(s_worker);
-            s_backend_register(be, s_worker->wake_rd, POLLIN, NULL);
+            s_kq_register(be, s_worker->wake_rd, POLLIN, NULL);
         }
     }
     return n;
 }
 
+#endif /* SUSPENDERS_HAS_KQUEUE */
+
 /* ============================================================================
  * POLL / WSAPOLL BACKEND
  * ============================================================================ */
-#elif SUSPENDERS_BACKEND_WSAPOLL || SUSPENDERS_BACKEND_POLL
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
 
-static suspenders_backend_t* s_backend_create(unsigned hint) {
+static suspenders_backend_t* s_poll_create(unsigned hint) {
     (void)hint;
     suspenders_backend_t *be = (suspenders_backend_t*)malloc(sizeof(*be));
     if (!be) return NULL;
     memset(be, 0, sizeof(*be));
-#if SUSPENDERS_BACKEND_WSAPOLL
+#if SUSPENDERS_HAS_WSAPOLL
     be->type = SUSPENDERS_BE_WSAPOLL;
 #else
     be->type = SUSPENDERS_BE_POLL;
@@ -3131,14 +3210,14 @@ static suspenders_backend_t* s_backend_create(unsigned hint) {
     return be;
 }
 
-static void s_backend_destroy(suspenders_backend_t *be) {
+static void s_poll_destroy(suspenders_backend_t *be) {
     if (!be) return;
     free(be->poll.fds);
     free(be->poll.crs);
     free(be);
 }
 
-static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr) {
+static int s_poll_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr) {
     if (be->poll.nfds >= be->poll.cap) {
         int new_cap = be->poll.cap * 2;
         struct pollfd *new_fds = (struct pollfd*)realloc(be->poll.fds, sizeof(struct pollfd) * new_cap);
@@ -3157,10 +3236,10 @@ static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, ui
     return 0;
 }
 
-static void s_backend_unregister(suspenders_backend_t *be, suspenders_sock_t fd) {
+static void s_poll_unregister(suspenders_backend_t *be, suspenders_sock_t fd) {
     int j = 0;
     for (int i = 0; i < be->poll.nfds; i++) {
-        if (be->poll.fds[i].fd == (int)fd) {
+        if ((suspenders_sock_t)be->poll.fds[i].fd == fd) {
             continue; /* skip - consumed or cancelled */
         }
         be->poll.fds[j] = be->poll.fds[i];
@@ -3170,7 +3249,7 @@ static void s_backend_unregister(suspenders_backend_t *be, suspenders_sock_t fd)
     be->poll.nfds = j;
 }
 
-static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
+static int s_poll_wait(suspenders_backend_t *be, int timeout_ms) {
     if (be->poll.nfds == 0) {
         if (timeout_ms < 0) timeout_ms = 1;
 #ifdef SUSPENDERS_PLATFORM_WINDOWS
@@ -3181,7 +3260,7 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
         return 0;
     }
 
-#if SUSPENDERS_BACKEND_WSAPOLL
+#if SUSPENDERS_HAS_WSAPOLL
     int n = WSAPoll(be->poll.fds, be->poll.nfds, timeout_ms);
 #else
     int n = poll(be->poll.fds, be->poll.nfds, timeout_ms);
@@ -3214,9 +3293,90 @@ static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
     return found;
 }
 
-#else
-    #error "No event backend available for this platform"
+#endif /* POLL / WSAPOLL */
+
+/* --- unified backend dispatch -------------------------------------------- */
+
+static suspenders_backend_t* s_backend_create(unsigned hint) {
+#if SUSPENDERS_HAS_IOURING
+    if (s_kernel_iouring_reliable()) {
+        suspenders_backend_t *be = s_iou_create(hint);
+        if (be) return be;
+    }
 #endif
+#if SUSPENDERS_HAS_KQUEUE
+    return s_kq_create(hint);
+#elif SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
+    return s_poll_create(hint);
+#else
+    (void)hint;
+    return NULL;
+#endif
+}
+
+static void s_backend_destroy(suspenders_backend_t *be) {
+    if (!be) return;
+    switch (be->type) {
+#if SUSPENDERS_HAS_IOURING
+    case SUSPENDERS_BE_IOURING: s_iou_destroy(be); return;
+#endif
+#if SUSPENDERS_HAS_KQUEUE
+    case SUSPENDERS_BE_KQUEUE:  s_kq_destroy(be); return;
+#endif
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
+    case SUSPENDERS_BE_POLL:
+    case SUSPENDERS_BE_WSAPOLL: s_poll_destroy(be); return;
+#endif
+    default: free(be); return;
+    }
+}
+
+static int s_backend_register(suspenders_backend_t *be, suspenders_sock_t fd, uint32_t events, suspenders_cr_t *cr) {
+    if (!be) return -1;
+    switch (be->type) {
+#if SUSPENDERS_HAS_KQUEUE
+    case SUSPENDERS_BE_KQUEUE:  return s_kq_register(be, fd, events, cr);
+#endif
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
+    case SUSPENDERS_BE_POLL:
+    case SUSPENDERS_BE_WSAPOLL: return s_poll_register(be, fd, events, cr);
+#endif
+    default:
+        (void)fd; (void)events; (void)cr;
+        return -1; /* io_uring uses completion ops, not readiness register */
+    }
+}
+
+static void s_backend_unregister(suspenders_backend_t *be, suspenders_sock_t fd) {
+    if (!be) return;
+    switch (be->type) {
+#if SUSPENDERS_HAS_KQUEUE
+    case SUSPENDERS_BE_KQUEUE:  s_kq_unregister(be, fd); return;
+#endif
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
+    case SUSPENDERS_BE_POLL:
+    case SUSPENDERS_BE_WSAPOLL: s_poll_unregister(be, fd); return;
+#endif
+    default: (void)fd; return;
+    }
+}
+
+static int s_backend_wait(suspenders_backend_t *be, int timeout_ms) {
+    if (!be) return 0;
+    switch (be->type) {
+#if SUSPENDERS_HAS_IOURING
+    case SUSPENDERS_BE_IOURING: return s_iou_wait(be, timeout_ms);
+#endif
+#if SUSPENDERS_HAS_KQUEUE
+    case SUSPENDERS_BE_KQUEUE:  return s_kq_wait(be, timeout_ms);
+#endif
+#if SUSPENDERS_HAS_POLL || SUSPENDERS_HAS_WSAPOLL
+    case SUSPENDERS_BE_POLL:
+    case SUSPENDERS_BE_WSAPOLL: return s_poll_wait(be, timeout_ms);
+#endif
+    default: (void)timeout_ms; return 0;
+    }
+}
 
 /* ============================================================================
  * UNIFIED BLOCKING I/O LAYER
@@ -3279,7 +3439,6 @@ static int s_io_block_poll(suspenders_sock_t fd, short events) {
     return 0;
 }
 
-#if !SUSPENDERS_BACKEND_IOURING
 static void s_io_timeout_cb(void *arg) {
     suspenders_cr_t *cr = (suspenders_cr_t*)arg;
     if (cr->state == SUSPENDERS_STATE_SUSPENDED) {
@@ -3287,16 +3446,14 @@ static void s_io_timeout_cb(void *arg) {
         suspenders_resume(cr);
     }
 }
-#endif
 
 /* Park until fd is ready (readiness backends), or block in poll(2) outside
  * a coroutine. Returns 0 when ready, -1 with suspenders_errno set. */
 static int s_io_wait_ready(suspenders_sock_t fd, uint32_t events) {
     if (!s_io_is_cr()) return s_io_block_poll(fd, (short)events);
-#if SUSPENDERS_BACKEND_IOURING
-    /* Coroutines on io_uring use completion ops, never readiness waits. */
-    return s_io_block_poll(fd, (short)events);
-#else
+    /* Completion-mode io_uring never parks via readiness; poll/kqueue do. */
+    if (s_backend_is_iouring())
+        return s_io_block_poll(fd, (short)events);
     suspenders_cr_t *cr = suspenders_running;
     cr->io_result = 0;
     if (SUSPENDERS_UNLIKELY(
@@ -3328,13 +3485,12 @@ static int s_io_wait_ready(suspenders_sock_t fd, uint32_t events) {
         return -1;
     }
     return 0;
-#endif
 }
 
 static ssize_t s_io_recv(suspenders_sock_t fd, void *buf, size_t len) {
     if (s_io_pre() != 0) return -1;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr())
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring())
         return s_iou_op(S_IOU_RECV, fd, buf, len, NULL, 0, NULL, 0, NULL);
 #endif
     for (;;) {
@@ -3351,8 +3507,8 @@ static ssize_t s_io_recv(suspenders_sock_t fd, void *buf, size_t len) {
 
 static ssize_t s_io_send(suspenders_sock_t fd, const void *buf, size_t len) {
     if (s_io_pre() != 0) return -1;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr())
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring())
         return s_iou_op(S_IOU_SEND, fd, (void*)(uintptr_t)buf, len, NULL, 0, NULL, 0, NULL);
 #endif
     for (;;) {
@@ -3374,8 +3530,8 @@ static ssize_t s_io_readv(suspenders_sock_t fd, const struct iovec *iov, int iov
     suspenders_errno = SUSPENDERS_ERROR;
     return -1;
 #else
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr())
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring())
         return s_iou_op(S_IOU_READV, fd, NULL, 0, iov, iovcnt, NULL, 0, NULL);
 #endif
     for (;;) {
@@ -3398,8 +3554,8 @@ static ssize_t s_io_writev(suspenders_sock_t fd, const struct iovec *iov, int io
     suspenders_errno = SUSPENDERS_ERROR;
     return -1;
 #else
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr())
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring())
         return s_iou_op(S_IOU_WRITEV, fd, NULL, 0, iov, iovcnt, NULL, 0, NULL);
 #endif
     for (;;) {
@@ -3417,8 +3573,8 @@ static ssize_t s_io_writev(suspenders_sock_t fd, const struct iovec *iov, int io
 
 static suspenders_sock_t s_io_accept(suspenders_sock_t fd) {
     if (s_io_pre() != 0) return SUSPENDERS_INVALID_SOCK;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr()) {
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring()) {
         ssize_t r = s_iou_op(S_IOU_ACCEPT, fd, NULL, 0, NULL, 0, NULL, 0, NULL);
         return r < 0 ? SUSPENDERS_INVALID_SOCK : (suspenders_sock_t)r;
     }
@@ -3437,8 +3593,8 @@ static suspenders_sock_t s_io_accept(suspenders_sock_t fd) {
 
 static int s_io_connect(suspenders_sock_t fd, const struct sockaddr *addr, socklen_t addrlen) {
     if (s_io_pre() != 0) return -1;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr()) {
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring()) {
         return s_iou_op(S_IOU_CONNECT, fd, NULL, 0, NULL, 0, addr, addrlen, NULL) < 0 ? -1 : 0;
     }
 #endif
@@ -3463,8 +3619,8 @@ static int s_io_connect(suspenders_sock_t fd, const struct sockaddr *addr, sockl
 static ssize_t s_io_recvfrom(suspenders_sock_t fd, void *buf, size_t len,
                              struct sockaddr *addr, socklen_t *addrlen) {
     if (s_io_pre() != 0) return -1;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr()) {
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring()) {
         struct iovec iv = { buf, len };
         struct msghdr msg;
         memset(&msg, 0, sizeof(msg));
@@ -3496,8 +3652,8 @@ static ssize_t s_io_recvfrom(suspenders_sock_t fd, void *buf, size_t len,
 static ssize_t s_io_sendto(suspenders_sock_t fd, const void *buf, size_t len,
                            const struct sockaddr *addr, socklen_t addrlen) {
     if (s_io_pre() != 0) return -1;
-#if SUSPENDERS_BACKEND_IOURING
-    if (s_io_is_cr()) {
+#if SUSPENDERS_HAS_IOURING
+    if (s_io_is_cr() && s_backend_is_iouring()) {
         struct iovec iv = { (void*)(uintptr_t)buf, len };
         struct msghdr msg;
         memset(&msg, 0, sizeof(msg));
@@ -4182,9 +4338,22 @@ static void suspenders_timer_heap_remove(suspenders_timer_t *t) {
 }
 
 uint64_t suspenders_now_ns(void) {
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+    static LARGE_INTEGER freq;
+    static int freq_ready = 0;
+    if (!freq_ready) {
+        QueryPerformanceFrequency(&freq);
+        freq_ready = 1;
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    /* ns = counter * 1e9 / freq, careful with overflow */
+    return (uint64_t)((counter.QuadPart * 1000000000ULL) / (uint64_t)freq.QuadPart);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
 }
 
 /* Arm a caller-owned (typically stack- or cr-resident) timer whose
@@ -4855,10 +5024,14 @@ static void s_worker_loop(bool is_run_caller) {
             if (suspenders_backend) {
                 s_backend_wait(suspenders_backend, timeout_ms);
             } else if (timeout_ms > 0) {
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+                Sleep((DWORD)timeout_ms);
+#else
                 struct timespec ts;
                 ts.tv_sec = timeout_ms / 1000;
                 ts.tv_nsec = (timeout_ms % 1000) * 1000000LL;
                 nanosleep(&ts, NULL);
+#endif
             }
         }
         suspenders_atomic_store(w->parked, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
@@ -4868,9 +5041,13 @@ static void s_worker_loop(bool is_run_caller) {
 
 /* Register this worker's wake fd with its (thread-local) backend. */
 static void s_worker_register_wake(suspenders_worker_t *w) {
-#if SUSPENDERS_BACKEND_IOURING
-    s_iou_arm_wake(w);
-#elif !defined(SUSPENDERS_PLATFORM_WINDOWS)
+#if SUSPENDERS_HAS_IOURING
+    if (s_backend_is_iouring()) {
+        s_iou_arm_wake(w);
+        return;
+    }
+#endif
+#if !defined(SUSPENDERS_PLATFORM_WINDOWS)
     s_backend_register(suspenders_backend, w->wake_rd, POLLIN, NULL);
 #else
     (void)w;
@@ -4896,10 +5073,12 @@ static void* s_worker_thread_main(void *arg) {
     suspenders_backend = s_backend_create(s_queue_hint);
     if (SUSPENDERS_UNLIKELY(!suspenders_backend)) return NULL;
 
-#if SUSPENDERS_BACKEND_IOURING
-    static SUSPENDERS_TLS suspenders_io_op_t s_wake_op_tls;
-    memset(&s_wake_op_tls, 0, sizeof(s_wake_op_tls));   /* cr == NULL: sentinel */
-    w->wake_op = &s_wake_op_tls;
+#if SUSPENDERS_HAS_IOURING
+    if (suspenders_backend->type == SUSPENDERS_BE_IOURING) {
+        static SUSPENDERS_TLS suspenders_io_op_t s_wake_op_tls;
+        memset(&s_wake_op_tls, 0, sizeof(s_wake_op_tls));   /* cr == NULL: sentinel */
+        w->wake_op = &s_wake_op_tls;
+    }
 #endif
     s_worker_register_wake(w);
 
@@ -4967,10 +5146,14 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
     memset(s_injector_tails, 0, sizeof(s_injector_tails));
     suspenders_atomic_store(s_injector_count, 0, SUSPENDERS_MEMORY_ORDER_SEQ_CST);
 
-    /* sizeof(worker) is a multiple of the cache line (aligned first member),
-     * as aligned_alloc requires. */
+    /* sizeof(worker) is a multiple of the cache line (aligned first member). */
+#ifdef SUSPENDERS_PLATFORM_WINDOWS
+    s_workers = (suspenders_worker_t*)_aligned_malloc(
+        num_workers * sizeof(suspenders_worker_t), SUSPENDERS_CACHELINE);
+#else
     s_workers = (suspenders_worker_t*)aligned_alloc(
         SUSPENDERS_CACHELINE, num_workers * sizeof(suspenders_worker_t));
+#endif
     if (SUSPENDERS_UNLIKELY(!s_workers)) {
         s_backend_destroy(suspenders_backend);
         suspenders_backend = NULL;
@@ -4986,7 +5169,11 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
         suspenders_atomic_init(w->parked, 0);
         if (!s_wake_fd_create(w)) {
             for (unsigned j = 0; j < i; j++) s_wake_fd_destroy(&s_workers[j]);
+            #if defined(_MSC_VER)
+            _aligned_free(s_workers);
+            #else
             free(s_workers);
+            #endif
             s_workers = NULL;
             s_num_workers = 0;
             s_backend_destroy(suspenders_backend);
@@ -4997,8 +5184,8 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
     }
 
     s_worker = &s_workers[0];
-#if SUSPENDERS_BACKEND_IOURING
-    {
+#if SUSPENDERS_HAS_IOURING
+    if (suspenders_backend && suspenders_backend->type == SUSPENDERS_BE_IOURING) {
         static SUSPENDERS_TLS suspenders_io_op_t s_wake_op_w0;
         memset(&s_wake_op_w0, 0, sizeof(s_wake_op_w0));
         s_workers[0].wake_op = &s_wake_op_w0;
@@ -5019,7 +5206,11 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
                 pthread_join(s_workers[j].thread, NULL);
             }
             for (unsigned j = 0; j < num_workers; j++) s_wake_fd_destroy(&s_workers[j]);
+            #if defined(_MSC_VER)
+            _aligned_free(s_workers);
+            #else
             free(s_workers);
+            #endif
             s_workers = NULL;
             s_num_workers = 0;
             s_worker = NULL;
@@ -5108,7 +5299,11 @@ void suspenders_shutdown(void) {
     }
     if (s_workers) {
         for (unsigned i = 0; i < s_num_workers; i++) s_wake_fd_destroy(&s_workers[i]);
+        #if defined(_MSC_VER)
+        _aligned_free(s_workers);
+        #else
         free(s_workers);
+        #endif
         s_workers = NULL;
     }
     s_num_workers = 0;

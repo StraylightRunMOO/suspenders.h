@@ -8,7 +8,7 @@
  * 
  * Build:
  *   gcc -std=gnu11 -O2 -o tcp_pingpong tcp_pingpong.c \
- *       -I../include -I../third_party $(pkg-config --cflags --libs liburing) -lpthread
+ *       -I../include -I${MEMENTO_INCLUDE} $(pkg-config --cflags --libs liburing) -lpthread
  * 
  * Run:
  *   ./tcp_pingpong

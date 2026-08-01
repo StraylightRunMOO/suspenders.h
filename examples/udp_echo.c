@@ -5,7 +5,7 @@
  *
  * Build:
  *   gcc -std=gnu11 -O2 -o udp_echo udp_echo.c \
- *       -I../include -I../third_party $(pkg-config --cflags --libs liburing) -lpthread
+ *       -I../include -I${MEMENTO_INCLUDE} $(pkg-config --cflags --libs liburing) -lpthread
  */
 
 #ifndef _GNU_SOURCE

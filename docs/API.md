@@ -1,6 +1,6 @@
 # Suspenders C API Reference
 
-*libsuspenders 1.0 — header-only coroutines, channels, and async I/O for C11.*
+*libsuspenders 1.1 — header-only coroutines, channels, and async I/O for C11.*
 
 This is the reference for the C API. If you write C++17, see
 [API_CPP.md](API_CPP.md) — it wraps everything here in RAII types and lambdas,
