@@ -6,9 +6,9 @@
  * Version
  * ============================================================================ */
 #define SUSPENDERS_VERSION_MAJOR 1
-#define SUSPENDERS_VERSION_MINOR 1
-#define SUSPENDERS_VERSION_PATCH 1
-#define SUSPENDERS_VERSION "1.1.1"
+#define SUSPENDERS_VERSION_MINOR 2
+#define SUSPENDERS_VERSION_PATCH 0
+#define SUSPENDERS_VERSION "1.2.0"
 #define SUSPENDERS_VERSION_NUMBER \
     (SUSPENDERS_VERSION_MAJOR * 10000 + SUSPENDERS_VERSION_MINOR * 100 + SUSPENDERS_VERSION_PATCH)
 
@@ -584,6 +584,7 @@ typedef enum {
     SUSPENDERS_HOSE_PROTO_UNIX,
     SUSPENDERS_HOSE_PROTO_PIPE,
     SUSPENDERS_HOSE_PROTO_TTY,
+    SUSPENDERS_HOSE_PROTO_QUIC,
 } suspenders_hose_protocol_t;
 
 struct suspenders_hose_s {
@@ -592,6 +593,9 @@ struct suspenders_hose_s {
     suspenders_sock_t fd;
     struct buf      *buffer;
     const suspenders_transport_ops_t *transport;
+    /* Transport-private state. QUIC stores the connection here; other
+     * transports leave it NULL. hose_init zeroes it. */
+    void            *priv;
 };
 
 /* ============================================================================
@@ -809,6 +813,7 @@ void  suspenders_hose_close(suspenders_hose_t *d);
     #pragma clang diagnostic ignored "-Wc99-extensions"
     #pragma clang diagnostic ignored "-Wc++20-designator"
     #pragma clang diagnostic ignored "-Wmissing-field-initializers"
+    #pragma clang diagnostic ignored "-Wnested-anon-types"
   #elif defined(__GNUC__)
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Wpedantic"
@@ -2027,15 +2032,15 @@ suspenders_chan_t* suspenders_chan_create(size_t elem_sz, size_t buf_sz) {
     /* Over-allocate so the 64-byte-aligned chan (and its ring, right after
      * it) fit regardless of the heap's natural 16-byte alignment. */
     memento_thread_heap_t *heap = memento_thread_heap_get();
-    size_t total = sizeof(suspenders_chan_t) + SUSPENDERS_CACHELINE + elem_sz * buf_sz;
-    void *base = memento_thread_heap_alloc(heap, total);
+    /* v3 exact aligned alloc: the channel (and the ring that follows it)
+     * starts on a cache line without the manual over-align slop. */
+    size_t total = sizeof(suspenders_chan_t) + elem_sz * buf_sz;
+    void *base = memento_thread_heap_alloc_aligned(heap, total, SUSPENDERS_CACHELINE);
     if (SUSPENDERS_UNLIKELY(!base)) {
         suspenders_errno = SUSPENDERS_NOMEM;
         return NULL;
     }
-    uintptr_t aligned = ((uintptr_t)base + SUSPENDERS_CACHELINE - 1) &
-                        ~((uintptr_t)SUSPENDERS_CACHELINE - 1);
-    suspenders_chan_t *ch = (suspenders_chan_t*)aligned;
+    suspenders_chan_t *ch = (suspenders_chan_t*)base;
     memset(ch, 0, sizeof(*ch));
     ch->elem_sz = elem_sz;
     ch->buf_sz = buf_sz;
@@ -2053,7 +2058,8 @@ suspenders_chan_t* suspenders_chan_make(size_t elem_sz, size_t buf_sz) {
 
 void suspenders_chan_destroy(suspenders_chan_t *ch) {
     if (!ch) return;
-    memento_thread_heap_free(ch->owner_heap, ch->alloc_base, ch->alloc_size);
+    memento_thread_heap_free_aligned(ch->owner_heap, ch->alloc_base, ch->alloc_size,
+                                     SUSPENDERS_CACHELINE);
 }
 
 static int s_chan_send_impl(suspenders_chan_t *ch, void *val,
@@ -3698,6 +3704,7 @@ static bool suspenders_hose_parse_uri(const char *uri, suspenders_hose_t *d, cha
     static const struct { const char *prefix; suspenders_hose_protocol_t proto; } schemes[] = {
         {"tcp://",  SUSPENDERS_HOSE_PROTO_TCP},
         {"udp://",  SUSPENDERS_HOSE_PROTO_UDP},
+        {"quic://", SUSPENDERS_HOSE_PROTO_QUIC},
         {"unix://", SUSPENDERS_HOSE_PROTO_UNIX},
         {"pipe://", SUSPENDERS_HOSE_PROTO_PIPE},
         {"tty://",  SUSPENDERS_HOSE_PROTO_TTY},
@@ -3707,7 +3714,9 @@ static bool suspenders_hose_parse_uri(const char *uri, suspenders_hose_t *d, cha
         if (strncmp(uri, schemes[i].prefix, len) == 0) {
             *scheme_out = schemes[i].prefix;
             d->protocol = schemes[i].proto;
-            if (d->protocol == SUSPENDERS_HOSE_PROTO_TCP || d->protocol == SUSPENDERS_HOSE_PROTO_UDP) {
+            if (d->protocol == SUSPENDERS_HOSE_PROTO_TCP ||
+                d->protocol == SUSPENDERS_HOSE_PROTO_UDP ||
+                d->protocol == SUSPENDERS_HOSE_PROTO_QUIC) {
                 return sscanf(uri + len, "%255[^:]:%d", host, port) == 2;
             } else if (d->protocol == SUSPENDERS_HOSE_PROTO_UNIX || d->protocol == SUSPENDERS_HOSE_PROTO_PIPE || d->protocol == SUSPENDERS_HOSE_PROTO_TTY) {
                 strncpy(host, uri + len, 256);
@@ -4239,7 +4248,13 @@ void suspenders_hose_close(suspenders_hose_t *d) {
  * TRANSPORT REGISTRY
  * ============================================================================ */
 bool suspenders_transport_register(const suspenders_transport_ops_t *ops) {
-    if (suspenders_transport_count >= 16 || !ops || !ops->scheme) return false;
+    int i;
+    if (!ops || !ops->scheme) return false;
+    for (i = 0; i < suspenders_transport_count; i++) {
+        if (strcmp(suspenders_transport_registry[i]->scheme, ops->scheme) == 0)
+            return true; /* init is re-entrant; don't fill the table twice */
+    }
+    if (suspenders_transport_count >= 16) return false;
     suspenders_transport_registry[suspenders_transport_count++] = ops;
     return true;
 }
@@ -5117,9 +5132,16 @@ static void* s_worker_thread_main(void *arg) {
     suspenders_main_cr = NULL;
     suspenders_running = NULL;
     suspenders_initialized = 0;
+    /* Worker is done: give idle spans back. Live blocks (if a buggy caller
+     * left any) stay mapped — release_caches only drops empty spans. */
+    memento_heap_release_caches(memento_thread_heap_get());
     return NULL;
 }
 #endif /* !Windows */
+
+#if defined(SUSPENDERS_HAVE_OPENSSL) && !defined(SUSPENDERS_PLATFORM_WINDOWS)
+#include "suspenders_quic.h"
+#endif
 
 int suspenders_init(unsigned num_workers, unsigned queue_hint) {
     memento_init();
@@ -5140,6 +5162,9 @@ int suspenders_init(unsigned num_workers, unsigned queue_hint) {
 
     suspenders_transport_register(&tcp_transport_ops);
     suspenders_transport_register(&udp_transport_ops);
+#if defined(SUSPENDERS_HAVE_OPENSSL) && !defined(SUSPENDERS_PLATFORM_WINDOWS)
+    suspenders_transport_register(&quic_transport_ops);
+#endif
 #if !defined(SUSPENDERS_PLATFORM_WINDOWS)
     suspenders_transport_register(&unix_transport_ops);
 #endif
@@ -5329,6 +5354,7 @@ void suspenders_shutdown(void) {
     /* Reset per-thread scheduler identity so a re-init starts clean. */
     suspenders_main_cr = NULL;
     suspenders_running = NULL;
+    memento_heap_release_caches(memento_thread_heap_get());
     memento_shutdown();
     suspenders_initialized = 0;
 #ifdef SUSPENDERS_PLATFORM_WINDOWS

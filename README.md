@@ -46,8 +46,11 @@ gives exact counts.
   for the Windows path
 - liburing 2.0+ on Linux (implementation TU only — consumers of the header
   don't need it)
-- **Memento** v2.2.1+ (FetchContent by default; override with
-  `-DSUSPENDERS_MEMENTO_SOURCE=/path/to/memento`)
+- **Memento** v3.0.0 (FetchContent by default; override with
+  `-DSUSPENDERS_MEMENTO_SOURCE=/path/to/memento`). Exact-size thread heaps;
+  the inline tcache is the hot path.
+- OpenSSL 3 (optional). When `libssl` is found, the `quic://` hose transport
+  is compiled in. Without it, that scheme is not registered.
 - CMake 3.16+ for the test/benchmark/example tree
 - C++17 for the optional `suspenders.hpp` facade
 
@@ -219,7 +222,7 @@ queue.
 ### Async I/O (hoses)
 
 Transport-agnostic descriptors over a registry (`tcp://`, `udp://`,
-`unix://`, `tty://`); every operation suspends the calling coroutine and is
+`quic://`, `unix://`, `tty://`); every operation suspends the calling coroutine and is
 completed by the backend (real async `recv/send/accept/connect/readv/writev`
 SQEs on io_uring; readiness + nonblocking syscall on kqueue/poll):
 
@@ -280,7 +283,7 @@ barrier_async with lambdas; `Queue::global(qos)`), `Hose`, and `Buffer`.
 ## Memory model
 
 All coroutine control blocks, stacks, channels, queues, and tasks are
-allocated through the [Memento](https://github.com/StraylightRunMOO/memento) allocator (FetchContent v2.2.1+):
+allocated through the [Memento](https://github.com/StraylightRunMOO/memento) allocator (FetchContent v3.0.0):
 one size-classed heap per thread, an arena per coroutine stack, and a
 lock-free MPSC return path for cross-thread frees (a worker freeing another
 worker's memory pushes it to the owner's heap, which flushes when idle).
@@ -314,8 +317,15 @@ size headers on blocks.
    that runs them. `suspenders_init` / `run` / `shutdown` stay on one
    thread; `shutdown` also tears down Memento (`memento_shutdown`), so
    drop any other Memento-backed jobs first.
-4. Default stack is 1 MB per coroutine; avoid deep recursion.
-5. Call `suspenders_shutdown()` from the thread that called
+4. Default stack is 1 MB per coroutine; avoid deep recursion. Memento's
+   guarded arenas protect the high end of a bump block, which is the wrong
+   side of a downward-growing fiber stack, so coroutine stacks stay on the
+   ordinary arena.
+5. `quic://host:port` is QUIC v1 over UDP (TLS 1.3, X25519, AES-128-GCM,
+   ALPN `susp`, one bidi stream). CertificateVerify is checked, but there
+   is no PKI or name pinning. Needs OpenSSL 3. See `docs/ebpf-iouring.md`
+   for why this tree does not put eBPF in the io_uring path.
+6. Call `suspenders_shutdown()` from the thread that called
    `suspenders_init()`, after `run()` returns.
 
 ## License

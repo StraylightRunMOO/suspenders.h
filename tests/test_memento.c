@@ -280,7 +280,14 @@ static int test_pool(void) {
         ASSERT_NOT_NULL(objs[i]);
         memset(objs[i], i, 48);
     }
-    ASSERT_NULL(memento_pool_alloc(pool));   /* exhausted */
+    /* Memento 3 pools grow instead of failing when the first chunk is full. */
+    {
+        void *ninth = memento_pool_alloc(pool);
+        ASSERT_NOT_NULL(ninth);
+        memset(ninth, 9, 48);
+        ASSERT_EQ_INT(0, ((unsigned char *)objs[0])[0]);
+        memento_pool_free(pool, ninth);
+    }
 
     for (int i = 0; i < 8; i++) {
         memento_pool_free(pool, objs[i]);

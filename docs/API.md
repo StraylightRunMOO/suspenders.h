@@ -1031,8 +1031,11 @@ calling coroutine and resumes it when the I/O completes. On Linux, that
 means io_uring under the hood. You never see a completion callback or a
 poll loop.
 
-The URI scheme selects the transport: `tcp://`, `udp://`, `unix://`,
-`tty://`. You can register your own.
+The URI scheme selects the transport: `tcp://`, `udp://`, `quic://`,
+`unix://`, `tty://`. You can register your own. `quic://` is compiled in
+when OpenSSL 3 is available (POSIX). It is QUIC v1 with one bidirectional
+stream mapped onto `read`/`write`; the handshake checks CertificateVerify
+and does not authenticate a name.
 
 ### suspenders_hose_init()
 
@@ -1264,9 +1267,9 @@ it left off. Thousands of connections, straight-line code.
 
 ## Transports
 
-Suspenders ships with built-in transports for `tcp://`, `udp://`, `unix://`,
-and `tty://`. You can add your own by implementing the transport ops vtable
-and registering it.
+Suspenders ships with built-in transports for `tcp://`, `udp://`, `quic://`
+(OpenSSL 3, POSIX), `unix://`, and `tty://`. You can add your own by
+implementing the transport ops vtable and registering it.
 
 ### suspenders_transport_register()
 

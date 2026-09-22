@@ -334,6 +334,81 @@ static int test_hose_tcp(void) {
     return suspenders_hose_test_pass ? 0 : 1;
 }
 
+#if defined(SUSPENDERS_HAVE_OPENSSL) && !defined(_WIN32)
+#define QUIC_TEST_PORT 54329
+static _Atomic int quic_test_pass = 0;
+static _Atomic int quic_server_ready = 0;
+
+static void quic_server_cr(void *arg) {
+    suspenders_hose_t listener, *client;
+    char uri[64];
+    char buf[64];
+    ssize_t n;
+    (void)arg;
+    suspenders_hose_init(&listener, NULL);
+    snprintf(uri, sizeof(uri), "quic://0.0.0.0:%d", QUIC_TEST_PORT);
+    if (!suspenders_hose_listen(&listener, uri)) {
+        fprintf(stderr, "[quic] listen failed\n");
+        return;
+    }
+    quic_server_ready = 1;
+    client = memento_thread_heap_alloc(memento_thread_heap_get(), sizeof(*client));
+    if (!client) { suspenders_hose_close(&listener); return; }
+    if (!suspenders_hose_accept(&listener, client)) {
+        fprintf(stderr, "[quic] accept failed\n");
+        memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
+        suspenders_hose_close(&listener);
+        return;
+    }
+    n = suspenders_hose_read(client, buf, sizeof(buf));
+    if (n > 0) suspenders_hose_write(client, buf, (size_t)n);
+    suspenders_hose_close(client);
+    memento_thread_heap_free(memento_thread_heap_get(), client, sizeof(*client));
+    suspenders_hose_close(&listener);
+}
+
+static void quic_client_cr(void *arg) {
+    suspenders_hose_t conn;
+    char uri[64];
+    char rbuf[64];
+    const char *msg = "HELLO QUIC";
+    ssize_t n;
+    int i;
+    (void)arg;
+    for (i = 0; i < 2000 && !quic_server_ready; i++)
+        suspenders_sleep_ns(1000000ULL);
+    suspenders_hose_init(&conn, NULL);
+    snprintf(uri, sizeof(uri), "quic://127.0.0.1:%d", QUIC_TEST_PORT);
+    if (!suspenders_hose_dial(&conn, uri)) {
+        fprintf(stderr, "[quic] dial failed\n");
+        return;
+    }
+    if (suspenders_hose_write(&conn, msg, strlen(msg)) <= 0) {
+        fprintf(stderr, "[quic] write failed\n");
+        suspenders_hose_close(&conn);
+        return;
+    }
+    memset(rbuf, 0, sizeof(rbuf));
+    n = suspenders_hose_read(&conn, rbuf, sizeof(rbuf) - 1);
+    if (n == (ssize_t)strlen(msg) && memcmp(rbuf, msg, (size_t)n) == 0)
+        quic_test_pass = 1;
+    else
+        fprintf(stderr, "[quic] echo mismatch n=%zd\n", n);
+    suspenders_hose_close(&conn);
+}
+
+static int test_hose_quic(void) {
+    quic_test_pass = 0;
+    quic_server_ready = 0;
+    suspenders_init(st_workers(), 256);
+    suspenders_spawn(quic_server_cr, NULL, SUSPENDERS_QOS_HIGH);
+    suspenders_spawn(quic_client_cr, NULL, SUSPENDERS_QOS_NORMAL);
+    suspenders_run();
+    suspenders_shutdown();
+    return quic_test_pass ? 0 : 1;
+}
+#endif
+
 /* -------------------------------------------------------------------------- */
 /* Test 9: QoS ordering - high priority runs first                            */
 /* -------------------------------------------------------------------------- */
@@ -2303,6 +2378,9 @@ static const st_test_t st_tests[] = {
     ST_TEST(test_channel_rendezvous),
     ST_TEST(test_buffer_ops),
     ST_TEST(test_hose_tcp),
+#if defined(SUSPENDERS_HAVE_OPENSSL) && !defined(_WIN32)
+    ST_TEST(test_hose_quic),
+#endif
     ST_TEST(test_qos_ordering),
     ST_TEST(test_cancel),
     ST_TEST(test_boost),

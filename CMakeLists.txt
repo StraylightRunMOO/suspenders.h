@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(libsuspenders VERSION 1.1.1 LANGUAGES C CXX)
+project(libsuspenders VERSION 1.2.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -12,7 +12,7 @@ option(SUSPENDERS_WERROR "Treat warnings as errors" ON)
 set(SUSPENDERS_SANITIZE "off" CACHE STRING
     "Sanitizer: off, address, undefined, address,undefined, or thread")
 set(SUSPENDERS_MEMENTO_SOURCE "" CACHE PATH
-    "Optional local Memento source tree (uses include/memento.h). Empty = FetchContent v2.2.1.")
+    "Optional local Memento source tree (uses include/memento.h). Empty = FetchContent v3.0.0.")
 
 # Compiler flags
 if(MSVC)
@@ -34,7 +34,7 @@ if(NOT SUSPENDERS_SANITIZE STREQUAL "off")
 endif()
 
 # ---------------------------------------------------------------------------
-# Memento (header-only) — FetchContent v2.2.1, or local tree override.
+# Memento (header-only) — FetchContent v3.0.0, or local tree override.
 # Use Populate (not MakeAvailable) so we only take the header; memento's own
 # CMake tests/examples stay out of this project's ctest graph, and we avoid
 # its BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include path (wrong when nested).
@@ -51,14 +51,14 @@ else()
     FetchContent_Declare(
         memento
         GIT_REPOSITORY https://github.com/StraylightRunMOO/memento.git
-        GIT_TAG        v2.2.1
+        GIT_TAG        v3.0.0
         GIT_SHALLOW    TRUE
     )
     FetchContent_GetProperties(memento)
     if(NOT memento_POPULATED)
         FetchContent_Populate(memento)
     endif()
-    message(STATUS "Memento: FetchContent v2.2.1 -> ${memento_SOURCE_DIR}")
+    message(STATUS "Memento: FetchContent v3.0.0 -> ${memento_SOURCE_DIR}")
 endif()
 set(MEMENTO_INCLUDE_DIR "${memento_SOURCE_DIR}/include")
 
@@ -104,6 +104,12 @@ endif()
 
 find_package(Threads REQUIRED)
 find_library(MATH_LIBRARY m)
+find_package(OpenSSL)
+if(OPENSSL_FOUND)
+    message(STATUS "OpenSSL: ${OPENSSL_VERSION} (QUIC hose)")
+else()
+    message(STATUS "OpenSSL: not found — quic:// transport disabled")
+endif()
 
 # Common include directories (memento is third-party: SYSTEM quiets its -Wunused
 # under our -Werror; still need a non-SYSTEM path so #include "memento.h" works
@@ -120,6 +126,10 @@ if(LIBURING_FOUND)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     list(APPEND SUSPENDERS_LINK_LIBS ws2_32)
+endif()
+if(OPENSSL_FOUND AND NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    list(APPEND SUSPENDERS_LINK_LIBS OpenSSL::SSL OpenSSL::Crypto)
+    add_compile_definitions(SUSPENDERS_HAVE_OPENSSL=1)
 endif()
 
 # Helper to add a C target
