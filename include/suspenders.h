@@ -2821,7 +2821,7 @@ int suspenders_waitgroup_wait(suspenders_waitgroup_t *wg) {
  *
  * Linux compiles both io_uring and poll. Init probes the kernel: io_uring is
  * used only when wakeups are reliable (kernel >= 5.19 / COOP_TASKRUN era);
- * otherwise we fall back to poll. See the v1.1 io_uring notes / v1.1 notes.
+ * otherwise we fall back to poll. Kernels before 5.19 do not wake reliably.
  * ============================================================================ */
 
 /* Backend struct definition */

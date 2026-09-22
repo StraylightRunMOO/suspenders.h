@@ -2219,7 +2219,7 @@ static int test_queue_destroy_global(void) {
 
 /* -------------------------------------------------------------------------- */
 /* Loop smoke: listener + per-conn hose I/O + timers + channels               */
-/* Regression for the pre-1.1 io_uring lost-wakeup hang (the v1.1 io_uring notes).  */
+/* Regression for the pre-1.1 io_uring lost-wakeup hang. */
 /* -------------------------------------------------------------------------- */
 #define LOOP_SMOKE_PORT 14043
 #define LOOP_SMOKE_CLIENTS 4

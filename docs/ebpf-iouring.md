@@ -1,99 +1,104 @@
 # eBPF and io_uring
 
-What was looked at, on the machine this tree is developed on (Linux
-5.15.148, libbpf 0.5, liburing 2.1), and what Suspenders should not pretend
-to gain from it.
-
-## What actually costs time here
-
 A hose round trip on the loopback is about 16 µs. A coroutine switch is
-about 33 ns. The gap is the socket operation and the suspend/wake, not the
-allocator and not the fd-table lookup inside `io_uring_enter`. Anything
-that adds a copy, a syscall, or a privilege check has to beat that 16 µs,
-not the 33 ns.
+about 33 ns. The interesting gap is the socket and the wake, not the
+allocator, and not the time io_uring spends finding a file descriptor.
+Anything that adds a copy, a syscall, or a capability check has to beat
+16 µs. Beating 33 ns is a hobby.
 
-`SUSPENDERS_IOURING_SQPOLL` was already measured 40% slower on this board
-(a kernel thread per ring steals a core from the workers). It stays off.
+This note is what was measured on the machine the library is developed on:
+Linux 5.15.148, libbpf 0.5, liburing 2.1. The conclusion is short. The
+designs that do not survive contact with that machine are listed so they
+do not have to be reinvented.
 
-Kernels before 5.19 are not used for io_uring at all. 5.15 falls back to
-poll, which is what this Jetson runs. An eBPF program attached to a ring
-that is not in use does nothing.
+## What the ring is already not doing
 
-## Combinations that exist, and why they do not fit
+Kernels before 5.19 are not used for io_uring. 5.15 falls back to `poll`
+at init. A BPF program attached to a ring that is not open does not become
+more clever by being attached. It becomes a program attached to nothing.
 
-**BPF inside the submission queue.** There is no stable operation that runs
-a BPF program as an SQE and returns a userspace buffer to a suspended
-coroutine. `IORING_OP_URING_CMD` is how nvme and ublk talk to the kernel,
-not a packet path. Loading a program also needs `CAP_BPF` or root. libbpf
-0.5 can load a reuseport program; it cannot express the 6.x helpers that
-newer write-ups assume.
+`SUSPENDERS_IOURING_SQPOLL` was measured 40% slower on this board: 22.4 µs
+against 16.0 µs for a 64-byte TCP round trip. The kernel polling thread
+takes a core the workers wanted. The flag stays off. BPF does not give the
+core back.
 
-**Registered / provided buffers.** Fixed buffers (`IORING_REGISTER_BUFFERS`)
-have been around since early io_uring, and they avoid `get_user_pages` on
-a buffer the ring already knows. The hose API reads into the caller's
-buffer. Using a registered bounce buffer means a memcpy on every read and
-write. For the sizes hoses move, that copy is larger than the page-pin it
-saves. Provided buffer rings (`io_uring_register_buf_ring`, multishot recv)
-landed in 5.19, which this kernel does not have, and they want the server
-to own the buffers. That fights `suspenders_hose_read(h, dest, len)`.
+## Designs that exist, and why they lose here
 
-**AF_XDP plus io_uring.** A real zero-copy path: XDP redirects frames to an
-`AF_XDP` socket and the ring completes the fill/completion queues. It
-replaces the socket, the hose, and demux. It is a different I/O stack, not
-a speedup of the one Suspenders has. Not worth it for a coroutine runtime
-whose unit of work is a suspending `read`.
+**A BPF program as a submission-queue entry.** There is no stable operation
+that runs BPF and then resumes a coroutine with a buffer. `IORING_OP_URING_CMD`
+is how nvme and ublk talk to their drivers. It is not a `recv`. Loading the
+program also wants `CAP_BPF` or root. libbpf 0.5 can load a reuseport
+program. It cannot express the helpers the newer write-ups assume. Those
+write-ups are about a different kernel than the one in the machine.
 
-**SQPOLL plus BPF.** SQPOLL already lost on this hardware. BPF does not
-change that.
+**Registered buffers.** `IORING_REGISTER_BUFFERS` has existed since early
+io_uring. It skips `get_user_pages` on a buffer the ring already knows.
+The hose call is `read` into the caller's memory. A registered bounce
+buffer is a memcpy on the way in and again on the way out. For the sizes
+a hose moves, the copy is larger than the pin it avoids. Provided buffer
+rings and multishot receive arrived in 5.19, which this kernel does not
+have, and they want the library to own the buffers. That is a different
+API. We did not change the API to win a benchmark we had not lost yet.
 
-## The combination that would pay, later
+**AF_XDP in front of the ring.** XDP redirects frames to an `AF_XDP`
+socket. io_uring completes the fill and completion queues. The result is
+fast and it is no longer a socket, a hose, or a coroutine that calls
+`read`. It is a second I/O stack. The unit of work here is a function that
+blocks in `read` and keeps its locals. Replacing that to save microseconds
+you then spend reconstructing the stack is a trade with one side missing.
 
-The cost that grows with workers is not the ring. It is a shared listen
-socket: one coroutine accepts, and the connection is then pinned to
-whichever worker drew it, so the data path crosses an inbox and a wake
-fd. The fix is to steer the packet to the worker before userspace sees it.
+## The design that would earn its keep
 
-On 5.15 the tool for that is `SO_ATTACH_REUSEPORT_EBPF`
+What grows with workers is not the ring. It is one listen socket. One
+coroutine accepts. The connection is then pinned to whichever worker drew
+it, and the bytes cross an inbox and a wake. Steering the packet before
+userspace sees it removes that hop.
+
+On 5.15 the tool is `SO_ATTACH_REUSEPORT_EBPF`
 (`BPF_PROG_TYPE_SK_REUSEPORT`, in the kernel since 4.6):
 
-- Each worker owns a UDP socket bound to the same port with `SO_REUSEPORT`.
-- The program hashes the QUIC destination connection id (bytes 6..13 of a
-  long-header Initial, or the DCID of a short header once the length is
-  known) and picks that worker's socket.
-- That worker's io_uring (or poll set) is the only one that wakes.
+- Each worker binds a UDP socket to the same port with `SO_REUSEPORT`.
+- The program hashes the QUIC destination connection id and returns that
+  worker's socket.
+- Only that worker's ring, or its poll set, wakes.
 
-Sketch, not shipped — it needs `CAP_BPF`, a socket per worker, and a CID
-map the current single-socket `quic://` listener does not have:
+A long-header Initial carries the destination id at byte 6 for 8 bytes,
+which is the length this stack uses. A short header carries it at byte 1.
+The program is not in the tree. It needs `CAP_BPF`, one socket per worker,
+and a connection-id map the current listener does not have. Sketch, so the
+next person does not start from a blank page:
 
 ```c
-/* SEC("sk_reuseport") — return the reuseport bucket for this skb. */
+/* SEC("sk_reuseport"): return the bucket for this packet. */
 int steer(struct sk_reuseport_md *md) {
     uint8_t dcid[8];
-    /* Long header: DCID length is byte 5, DCID starts at byte 6. */
-    if (bpf_skb_load_bytes(md, 6, dcid, 8) < 0)
+    if (bpf_skb_load_bytes(md, 6, dcid, sizeof(dcid)) < 0)
         return 0;
-    return dcid[0] % md->hash; /* or a SOCKARRAY lookup */
+    return dcid[0] % /* worker count */;
 }
 ```
 
-TCP has the same shape with `sk_lookup` (5.9+) or a reuseport program on
-the listener, keyed by the 4-tuple instead of a CID. Same privilege and
-same "one socket per worker" redesign. Do that when a workload is actually
-bound on accept fan-in, not on the 16 µs loopback RTT.
+TCP is the same shape with `sk_lookup` (5.9 or later) or a reuseport
+program keyed by the 4-tuple. Same privilege, same "one socket per worker"
+change. Build it when a profile says accept fan-in is the bottleneck.
+Until then it is a program that would have been loaded by a process that
+is not allowed to load it, in front of a cost that has not shown up.
 
-## What landed instead
+## What was done instead
 
-- Memento 3's per-thread tcache is the allocator hot path. `malloc_trim`
-  no longer discards page headers of a live span (that abandoned the span
-  and forced a new 2 MiB mapping). `memento_heap_release_caches` unmaps
-  only spans with nothing in user hands, and Suspenders calls it when a
-  worker exits and at shutdown.
-- `MADV_COLLAPSE` runs at most once per span, and the first `EINVAL` from a
-  kernel older than 6.1 disables it. It used to be a failing syscall on
-  every idle flush.
-- QUIC rides the existing UDP suspend path. No BPF.
+Memento 3's per-thread cache is the allocator hot path. `malloc_trim` no
+longer discards the header of a live span. `memento_heap_release_caches`
+unmaps a span only when the user holds nothing in it, and Suspenders calls
+that when a worker exits and at shutdown.
 
-Revisit registered buffers only if a profile shows `get_user_pages` inside
-a hose that reuses the same buffers. Revisit reuseport BPF when there is a
-multi-worker accept benchmark that is inbox-bound, and the process is
-allowed to load BPF.
+`MADV_COLLAPSE` is attempted once per span. The first `EINVAL` or `ENOSYS`
+— Linux before 6.1 — turns it off. It used to be a failing syscall on
+every idle flush, which is a novel way to spend the time you meant to save.
+
+QUIC uses the UDP path the hoses already had. No BPF.
+
+Come back to registered buffers if a profile shows `get_user_pages` on a
+hose that reuses its buffers. Come back to reuseport BPF when a
+multi-worker accept test is inbox-bound and the process may load BPF.
+Until one of those is true, the 16 µs is the number to beat, and it is not
+beaten by a program that does not run.
